@@ -1,0 +1,10 @@
+.venv/
+__pycache__/
+*.pyc
+output/*.png
+output/*.xlsx
+output/*.csv
+output/*.json
+output/batch/
+output/batch_history/
+!output/.gitkeep
