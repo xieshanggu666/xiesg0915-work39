@@ -11,6 +11,11 @@
    责任人缺失时回落到专业负责人；
 3. **状态流转**：``待整改 → 待复核 → 复核通过 / 驳回 → 已关闭``，
    重新核查消失自动消除（:func:`sweep_absent_tickets`）；
+3.1. **局部复查** :class:`ScanScope` / :func:`ingest_batch`：
+   支持按**单体 / 专业 / 核查项**圈定复查范围，记录模型版本（文件名 + 大小 +
+   内容指纹）与实际扫描范围（:class:`~ifc_audit.collab_model.ScanRun`）；
+   **仅对成功覆盖的工单自动销项**，不在范围内（out_of_scope）或扫描失败
+   （scan_failed）的工单保留原状态，门禁与通知随覆盖结果联动；
 4. **整改回写** :func:`writeback_fix`：责任专业回填整改说明与整改后构件，
    随 :func:`build_writeback` 回写到单体 / 批次结论；
 5. **权限** :func:`require_permission`：项目协调 / 三专业负责人 / 责任人 /
@@ -26,8 +31,9 @@
 
 from __future__ import annotations
 
+import hashlib
 import os
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 from typing import Optional, Callable
 
@@ -40,7 +46,7 @@ from .coordination_model import (
 )
 from .collab_model import (
     CollabTicket, ModelRef, RosterUser, Notification, CollabLedger,
-    make_ticket_fingerprint,
+    ScanRun, make_ticket_fingerprint,
     SOURCE_AUDIT, SOURCE_COORD, SOURCE_RULE, SOURCE_MANUAL, SOURCES, SOURCE_CN,
     SEVERITIES,
     STATUS_CLOSED, STATUS_CN,
@@ -50,8 +56,10 @@ from .collab_model import (
     ROLES, ROLE_CN, LEAD_DISCIPLINE, DISCIPLINE_LEAD,
     EVENT_CREATED, EVENT_ASSIGNED, EVENT_DUE_SOON, EVENT_OVERDUE,
     EVENT_ESCALATED, EVENT_FIXED, EVENT_REJECTED, EVENT_VERIFIED,
-    EVENT_CLOSED, EVENT_REOPENED, EVENT_GATE_BLOCKED,
+    EVENT_CLOSED, EVENT_REOPENED, EVENT_GATE_BLOCKED, EVENT_SCAN_INCOMPLETE,
     EVENT_CN, EVENT_LEVEL,
+    COVER_COVERED, COVER_OUT_OF_SCOPE, COVER_SCAN_FAILED, COVER_PRESENT,
+    COVER_CN,
 )
 
 # 系统账号：批量扫描 / 时限扫描等自动动作的操作者，绕过 RBAC
@@ -79,9 +87,258 @@ AUDIT_KIND_CN = {
     "opening_unassigned": "门窗未归属",
 }
 
+# audit 工单可选核查项标识（--recheck-kind 校验 / 中文名）
+AUDIT_KINDS = tuple(AUDIT_KIND_OWNER)
+
+AUDIT_KIND_SCOPE_CN = {
+    "wall": "墙体闭合",
+    "duplicate": "重复构件",
+    "room": "房间净面积",
+    "opening": "门窗规格",
+}
+
+# 核查项别名（CLI 友好）-> 展开为具体 kind
+KIND_ALIASES = {
+    "wall": ("wall_free_end", "wall_end_gap", "room_enclosure_gap",
+             "room_no_geometry"),
+    "duplicate": ("duplicate_element",),
+    "room": ("room_enclosure_gap", "room_no_geometry"),
+    "opening": ("opening_size_anomaly", "opening_unassigned"),
+}
+
 
 def _now() -> str:
     return datetime.now().isoformat(timespec="seconds")
+
+
+# ============================================================ 局部复查 ----
+
+@dataclass(frozen=True)
+class ScanScope:
+    """一次复查的申请范围（空集合表示该维度不限）。
+
+    * ``units``：单体名集合（= 模型文件名去后缀，与 ``UnitResult.name`` 一致）；
+    * ``disciplines``：专业集合（arch/struct/mep）；
+    * ``kinds``：核查项集合（audit 的 kind，如 ``wall_free_end``；
+      coord 工单按其涉及专业匹配，不按 kind 过滤）。
+    """
+
+    units: frozenset[str] = frozenset()
+    disciplines: frozenset[str] = frozenset()
+    kinds: frozenset[str] = frozenset()
+
+    @classmethod
+    def make(cls, units=(), disciplines=(), kinds=()) -> "ScanScope":
+        kind_set: set[str] = set()
+        for k in kinds or ():
+            kind_set.update(KIND_ALIASES.get(k, (k,)))
+        return cls(frozenset(units or ()), frozenset(disciplines or ()),
+                   frozenset(kind_set))
+
+    @property
+    def partial(self) -> bool:
+        return bool(self.units or self.disciplines or self.kinds)
+
+    def describe(self) -> str:
+        parts = []
+        if self.units:
+            parts.append("单体=" + "/".join(sorted(self.units)))
+        if self.disciplines:
+            parts.append("专业=" + "/".join(
+                DISC_CN.get(d, d) for d in sorted(self.disciplines)))
+        if self.kinds:
+            names = [AUDIT_KIND_CN.get(k, k) for k in sorted(self.kinds)]
+            parts.append("核查项=" + "/".join(names))
+        return "；".join(parts) or "全量复查"
+
+    def covers_kind(self, kind: str) -> bool:
+        return not self.kinds or kind in self.kinds
+
+    def covers_disciplines(self, discs) -> bool:
+        return (not self.disciplines
+                or bool(set(discs or []) & set(self.disciplines)))
+
+
+def model_file_version(path: str) -> str:
+    """计算模型文件版本标识：``大小-内容指纹``。
+
+    常规模型（≤256MB）整文件流式 SHA-1，任何字节变化都会换版；更大的模型
+    退化为「头/尾 1MB + 每 16MB 抽样 32KB」抽样哈希。文件不可读时退化为
+    大小 / mtime。
+    """
+    try:
+        size = os.path.getsize(path)
+        h = hashlib.sha1()
+        h.update(str(size).encode("utf-8"))
+        head_len = 1 << 20
+        full_hash_limit = 1 << 28      # 256MB 以内整文件哈希
+        with open(path, "rb") as f:
+            if size <= full_hash_limit:
+                for block in iter(lambda: f.read(1 << 22), b""):
+                    h.update(block)
+            else:
+                h.update(f.read(head_len))
+                step = 1 << 24          # 16MB
+                chunk = 1 << 15         # 32KB
+                tail_start = size - head_len
+                pos = step
+                while pos < tail_start:
+                    f.seek(pos)
+                    h.update(f.read(chunk))
+                    mid = pos + step // 2
+                    if mid < tail_start:
+                        f.seek(mid)
+                        h.update(f.read(chunk))
+                    pos += step
+                f.seek(tail_start)
+                h.update(f.read(head_len))
+        return f"{size}-{h.hexdigest()[:12]}"
+    except OSError:
+        try:
+            return f"mtime-{int(os.path.getmtime(path))}"
+        except OSError:
+            return "unknown"
+
+
+@dataclass
+class _ScanIndices:
+    """一次扫描按 (单体, 专业) 汇总的成功 / 失败索引，供覆盖判定。"""
+
+    ok_pairs: set[tuple[str, str]] = field(default_factory=set)
+    failed_pairs: set[tuple[str, str]] = field(default_factory=set)
+    failed_units: set[str] = field(default_factory=set)
+    pair_versions: dict[tuple[str, str], str] = field(default_factory=dict)
+    pair_files: dict[tuple[str, str], str] = field(default_factory=dict)
+    files_info: list[dict] = field(default_factory=list)
+    failed_files: list[dict] = field(default_factory=list)
+    scanned_units: set[str] = field(default_factory=set)
+
+
+def _guess_discipline_from_name(name: str) -> str:
+    """按文件名 / 单体名关键词推断专业（协同未运行时的回落）。"""
+    low = (name or "").lower()
+    if any(k in low for k in ("结构", "struct")):
+        return "struct"
+    if any(k in low for k in ("机电", "mep", "暖通", "给排水", "电气",
+                             "hvac", "piping", "水暖")):
+        return "mep"
+    if any(k in low for k in ("建筑", "arch")):
+        return "arch"
+    return "arch"
+
+
+def _build_scan_indices(batch, coord, *, hash_files: bool) -> _ScanIndices:
+    """从批次结果构建实际扫描成功 / 失败索引（audit 单体 + coord 专业模型）。"""
+    idx = _ScanIndices()
+
+    # 协同专业模型 -> (单体, 专业)；用于补全 audit 单体的实际专业归属
+    coord_disc_by_unit: dict[str, str] = {}
+    if coord is not None:
+        for f in getattr(coord, "files", []):
+            disc = getattr(f, "discipline", "") or ""
+            if getattr(f, "unit", ""):
+                coord_disc_by_unit.setdefault(f.unit, disc)
+            pair = (f.unit, disc)
+            if getattr(f, "ok", True):
+                idx.ok_pairs.add(pair)
+                if f.unit:
+                    idx.scanned_units.add(f.unit)
+                ver = ""
+                if hash_files and getattr(f, "file_path", ""):
+                    ver = model_file_version(f.file_path)
+                if ver:
+                    idx.pair_versions[pair] = ver
+                    idx.pair_files[pair] = f.file_path
+                    idx.files_info.append({
+                        "unit": f.unit, "discipline": disc,
+                        "file": f.file_path, "version": ver})
+            else:
+                idx.failed_pairs.add(pair)
+                if f.unit:
+                    idx.failed_units.add(f.unit)
+                idx.failed_files.append({
+                    "unit": f.unit, "discipline": disc,
+                    "file": getattr(f, "file_path", ""),
+                    "error": getattr(f, "error", "")})
+
+    for unit in batch.units:
+        guessed = coord_disc_by_unit.get(unit.name) \
+            or _guess_discipline_from_name(
+                f"{unit.name} {getattr(unit, 'file_path', '')}")
+        if getattr(unit, "model", None) is None:
+            # 单体扫描失败（无模型结果）：与其专业配对失败；
+            # 协同侧已记录过同一 (单体, 专业) 失败时去重
+            pair = (unit.name, guessed)
+            idx.failed_pairs.add(pair)
+            idx.failed_units.add(unit.name)
+            idx.ok_pairs.discard(pair)
+            if not any(f["unit"] == unit.name and f["discipline"] == guessed
+                       for f in idx.failed_files):
+                idx.failed_files.append({
+                    "unit": unit.name, "discipline": guessed,
+                    "file": getattr(unit, "file_path", ""),
+                    "error": getattr(unit, "error", "模型核查失败")})
+            continue
+        idx.scanned_units.add(unit.name)
+        pair = (unit.name, guessed)
+        idx.ok_pairs.add(pair)
+        fp = getattr(unit, "file_path", "")
+        ver = model_file_version(fp) if hash_files and fp else ""
+        if ver:
+            idx.pair_versions[pair] = ver
+            idx.pair_files[pair] = fp
+            idx.files_info.append({"unit": unit.name, "discipline": guessed,
+                                   "file": fp, "version": ver})
+    return idx
+
+
+def _ticket_scan_pairs(t: CollabTicket) -> list[tuple[str, str]]:
+    """工单依赖的 (单体, 专业) 配对（覆盖判定用）。"""
+    pairs: set[tuple[str, str]] = set()
+    if t.source == SOURCE_AUDIT:
+        units = {t.unit} if t.unit else set()
+        units.update(r.unit for r in t.refs if r.unit)
+        disc = t.owner_discipline or "arch"
+        pairs.update((u, disc) for u in units)
+    else:
+        for r in t.refs:
+            if r.unit:
+                pairs.add((r.unit, r.discipline
+                           or t.owner_discipline or ""))
+        if not pairs and t.unit:
+            pairs.add((t.unit, t.owner_discipline))
+    return sorted(pairs)
+
+
+def ticket_cover_result(t: CollabTicket, scope: ScanScope,
+                        idx: _ScanIndices) -> str:
+    """判定工单相对本次复查范围 / 实际扫描结果的覆盖结论。
+
+    * 不在范围（单体 / 专业 / 核查项任一不匹配）-> ``out_of_scope``；
+    * 在范围内但任一依赖 (单体, 专业) 模型扫描失败 -> ``scan_failed``；
+    * 范围外单体与失败单体同时存在时，``scan_failed`` 优先（提醒重扫）；
+    * 其余 -> ``covered``（无论本次是否仍检出；仍检出由纳管流程保活）。
+    """
+    if t.source not in (SOURCE_AUDIT, SOURCE_COORD):
+        return COVER_OUT_OF_SCOPE
+    if scope.units:
+        units = {t.unit} if t.unit else set()
+        units.update(r.unit for r in t.refs if r.unit)
+        if not (units & scope.units):
+            return COVER_OUT_OF_SCOPE
+    if scope.disciplines and not scope.covers_disciplines(
+            t.disciplines or [t.owner_discipline]):
+        return COVER_OUT_OF_SCOPE
+    if scope.kinds and not scope.covers_kind(t.kind):
+        return COVER_OUT_OF_SCOPE
+    pairs = _ticket_scan_pairs(t)
+    for p in pairs:
+        if p in idx.failed_pairs or p[0] in idx.failed_units:
+            return COVER_SCAN_FAILED
+    # 依赖的 (单体, 专业) 模型本次没有成功扫描 -> 未实际覆盖（范围外）
+    if pairs and not all(p in idx.ok_pairs for p in pairs):
+        return COVER_OUT_OF_SCOPE
+    return COVER_COVERED
 
 
 class CollabError(ValueError):
@@ -382,6 +639,9 @@ def ingest_coordination(ledger: CollabLedger, coord_result,
                         owners: Optional[dict[str, str]] = None,
                         sla_hours: float = 72.0,
                         sweep: bool = True,
+                        scope: Optional[ScanScope] = None,
+                        idx: Optional[_ScanIndices] = None,
+                        now: Optional[str] = None,
                         progress: Optional[Callable[[str], None]] = None
                         ) -> tuple[list[CollabTicket], set[str]]:
     """把一次多专业协同核查结果合入闭环台账。
@@ -389,19 +649,30 @@ def ingest_coordination(ledger: CollabLedger, coord_result,
     协同工单（COORD-xxxx）映射为闭环工单（COLL-xxxx），指纹沿用协同指纹，
     已在台账中的工单保留状态 / 责任人 / 整改记录。
 
+    Args:
+        scope: 局部复查范围；范围外的协同问题不纳管 / 不刷新。
+        idx: 批次扫描索引，用于在工单上盖实际模型版本戳。
+        sweep: 是否执行自动闭环与时限扫描（:func:`ingest_batch` 统一扫描时
+            传 ``False``）。
+
     Returns:
-        (本批协同工单, 本批检出的协同工单指纹集合)。``sweep=False`` 时跳过
-        自动闭环与时限扫描（供 :func:`ingest_batch` 统一扫描）。
+        (本批协同工单, 本批检出且在范围内的协同工单指纹集合)。
     """
+    scope = scope or ScanScope()
+    now = now or _now()
     owners = owners or dict(getattr(coord_result, "owners", {}) or {})
     file_by_unit = {f.unit: f.file_path for f in getattr(coord_result, "files", [])
                     if getattr(f, "file_path", "")}
-    now = _now()
     seq = ledger.next_ticket_seq()
     out: list[CollabTicket] = []
     present: set[str] = set()
 
     for ci in coord_result.issues:
+        # 局部复查：专业 / 核查项范围外的协同问题不参与本次纳管
+        if not scope.covers_disciplines(ci.disciplines):
+            continue
+        if scope.kinds and not scope.covers_kind(ci.kind):
+            continue
         # 闭环台账以 (来源 + 协同指纹) 作主键，避免与其它来源撞键
         key = f"fp:{ci.fingerprint}"
         present.add(key)
@@ -439,6 +710,7 @@ def ingest_coordination(ledger: CollabLedger, coord_result,
                     f"多专业协同核查发现并派单（{COORD_KIND_CN.get(ci.kind, ci.kind)}）"
                     + (f"，整改时限 {sla_hours:g}h" if sla_hours > 0 else ""),
                     batch_id, at=now)
+            _stamp_scan(t, idx, batch_id, now, result=COVER_PRESENT)
             ledger.tickets[key] = t
             seq += 1
             notify(ledger, t, EVENT_CREATED,
@@ -448,6 +720,7 @@ def ingest_coordination(ledger: CollabLedger, coord_result,
         else:
             old.present_in_scan = True
             reopened = _refresh_from_scan(ledger, old, ci, refs, now, owners)
+            _stamp_scan(old, idx, batch_id, now, result=COVER_PRESENT)
             if reopened:
                 notify(ledger, old, EVENT_REOPENED,
                        body=f"协同问题回归重开：{old.title}",
@@ -455,11 +728,41 @@ def ingest_coordination(ledger: CollabLedger, coord_result,
             out.append(old)
 
     if sweep:
-        sweep_absent_tickets(ledger, present, {SOURCE_COORD}, batch_id, now)
-        apply_sla_sweep(ledger, sla_hours, batch_id)
+        if idx is None:
+            idx = _indices_from_coord(coord_result)
+        stats = _sweep_with_coverage(ledger, present, {SOURCE_COORD},
+                                     batch_id, scope=scope, idx=idx, now=now)
+        # 用空批次对象补登记复查记录（独立协同核查无 BatchResult）
+        _record_scan_run(ledger, batch_id, now, scope=scope, idx=idx,
+                         present=present, stats=stats)
+        apply_sla_sweep(ledger, sla_hours, batch_id,
+                        now=datetime.fromisoformat(now))
     if progress:
         progress(f"协同问题纳管完成：本批 {len(out)} 项")
     return out, present
+
+
+def _stamp_scan(t: CollabTicket, idx: Optional[_ScanIndices], batch_id: str,
+                now: str, *, result: str,
+                versions: Optional[dict[str, str]] = None) -> None:
+    """在工单上记录最近一次扫描 / 覆盖留痕（模型版本按 “单体|文件” 存）。"""
+    if versions is None:
+        versions = {}
+    if idx is not None:
+        for unit, disc in _ticket_scan_pairs(t):
+            ver = idx.pair_versions.get((unit, disc))
+            if ver:
+                versions[f"{unit}|{idx.pair_files.get((unit, disc), '')}"] = ver
+    # 只在确有扫描留痕时更新批次 / 时刻 / 版本，避免范围外工单被误记
+    if result == COVER_PRESENT or versions:
+        t.last_scan_batch = batch_id
+        t.last_scan_at = now
+        if versions:
+            t.last_scan_versions = versions
+    if result:
+        t.last_cover_result = result
+        t.last_cover_batch = batch_id
+        t.last_cover_at = now
 
 
 def _refresh_from_scan(ledger: CollabLedger, t: CollabTicket, ci, refs, now,
@@ -495,6 +798,8 @@ def ingest_batch(ledger: CollabLedger, batch,
                  sla_hours: float = 72.0,
                  include_infos: bool = False,
                  only_kinds: Optional[set[str]] = None,
+                 scope: Optional[ScanScope] = None,
+                 record_versions: bool = True,
                  progress: Optional[Callable[[str], None]] = None
                  ) -> list[CollabTicket]:
     """把一次批量审查（:class:`~ifc_audit.batch.BatchResult`）合入闭环台账。
@@ -502,7 +807,17 @@ def ingest_batch(ledger: CollabLedger, batch,
     纳管每个成功单体 ``unit.model.issues`` 中的单模型问题，以及
     ``batch.coordination`` 的协同问题（若有）。规则校验 / 门禁阻断问题可由
     :func:`ingest_rule_violations` 另行纳管。返回本批新增 / 现存的工单。
+
+    Args:
+        scope: 局部复查范围（单体 / 专业 / 核查项）。范围外工单不纳管、不刷新、
+            不参与自动销项，状态原样保留；范围内但对应模型扫描失败的工单同样保留。
+        record_versions: 是否记录模型文件版本（大小 + 内容指纹）到工单与复查记录。
+
+    每次合入都会在台账登记一条 :class:`~ifc_audit.collab_model.ScanRun`，
+    记录申请范围、实际成功 / 失败扫描的单体、模型版本与各类覆盖结果计数。
     """
+    if scope is None:
+        scope = ScanScope.make(kinds=only_kinds)
     batch_id = batch.batch_id
     now = _now()
     seq = ledger.next_ticket_seq()
@@ -510,25 +825,34 @@ def ingest_batch(ledger: CollabLedger, batch,
     present: set[str] = set()
     owners = {}
 
+    idx = _build_scan_indices(
+        batch, getattr(batch, "coordination", None),
+        hash_files=record_versions)
+
     coord = getattr(batch, "coordination", None)
     if coord is not None:
         owners = dict(getattr(coord, "owners", {}) or {})
         coord_tickets, coord_present = ingest_coordination(
             ledger, coord, batch_id, owners=owners, sla_hours=sla_hours,
-            sweep=False)
+            sweep=False, scope=scope, idx=idx, now=now)
         out.extend(coord_tickets)
         present.update(coord_present)
 
+    # 单模型问题均归属建筑专业；专业范围不含建筑时整体跳过
+    audit_in_disc = scope.covers_disciplines(["arch"])
     for unit in batch.units:
+        if scope.units and unit.name not in scope.units:
+            continue
         model = getattr(unit, "model", None)
         if model is None:
+            # 扫描失败的单体在 _sweep_with_coverage 中按 scan_failed 保留
             continue
         unit_name = unit.name
         file_path = getattr(unit, "file_path", "")
         for iss in model.issues:
             if iss.severity == "info" and not include_infos:
                 continue
-            if only_kinds is not None and iss.kind not in only_kinds:
+            if not scope.covers_kind(iss.kind) or not audit_in_disc:
                 continue
             disc = AUDIT_KIND_OWNER.get(iss.kind, "arch")
             extra = f"{iss.issue_id}|{iss.storey}"
@@ -561,6 +885,7 @@ def ingest_batch(ledger: CollabLedger, batch,
                 _record(t, "created", "", STATUS_OPEN, SYSTEM_ACTOR,
                         f"批量审查发现并派单（{AUDIT_KIND_CN.get(iss.kind, iss.kind)}）"
                         f"，整改时限 {sla_hours:g}h", batch_id, at=now)
+                _stamp_scan(t, idx, batch_id, now, result=COVER_PRESENT)
                 ledger.tickets[key] = t
                 seq += 1
                 notify(ledger, t, EVENT_CREATED,
@@ -575,6 +900,7 @@ def ingest_batch(ledger: CollabLedger, batch,
                 old.refs = refs
                 old.location = loc3
                 old.updated_at = now
+                _stamp_scan(old, idx, batch_id, now, result=COVER_PRESENT)
                 if old.closed:
                     old.status = STATUS_OPEN
                     old.escalated = False
@@ -588,42 +914,222 @@ def ingest_batch(ledger: CollabLedger, batch,
                            recipients=_owner_and_leads(ledger, old), at=now)
                 out.append(old)
 
-    # audit / coord 源本批未出现的活动工单自动闭环（人工与规则问题不自动消除）
-    sweep_absent_tickets(
-        ledger, present, {SOURCE_AUDIT, SOURCE_COORD}, batch_id, now)
+    # 仅对“范围内 + 扫描成功且未再检出”的工单自动销项；
+    # 范围外（out_of_scope）/ 扫描失败（scan_failed）工单状态保留
+    stats = _sweep_with_coverage(
+        ledger, present, {SOURCE_AUDIT, SOURCE_COORD}, batch_id,
+        scope=scope, idx=idx, now=now)
+    run = _record_scan_run(ledger, batch_id, now, scope=scope, idx=idx,
+                           present=present, stats=stats)
     apply_sla_sweep(ledger, sla_hours, batch_id)
     if progress:
+        if scope.partial or run.incomplete:
+            label = (f"局部复查（{scope.describe()}）" if scope.partial
+                     else "全量复查（部分模型扫描失败 / 缺失）")
+            progress(f"{label}：自动销项 "
+                     f"{run.n_auto_verified + run.n_auto_cleared} 项，"
+                     f"范围外保留 {run.n_out_of_scope} 项，"
+                     f"扫描失败保留 {run.n_scan_failed} 项，"
+                     f"失败模型 {len(run.failed_files)} 个")
         progress(f"批量审查问题纳管完成：台账共 {len(ledger.tickets)} 项")
     return out
 
 
-def sweep_absent_tickets(ledger: CollabLedger, present: set[str],
-                         sources: set[str], batch_id: str,
-                         now: Optional[str] = None) -> list[CollabTicket]:
-    """本批重新核查未检出的活动工单自动闭环；人工登记问题不自动消除。"""
-    now = now or _now()
-    changed: list[CollabTicket] = []
+def _indices_from_coord(coord, *, hash_files: bool = True) -> _ScanIndices:
+    idx = _ScanIndices()
+    for f in getattr(coord, "files", []):
+        unit = getattr(f, "unit", "")
+        disc = getattr(f, "discipline", "") or ""
+        pair = (unit, disc)
+        fp = getattr(f, "file_path", "")
+        if getattr(f, "ok", True):
+            idx.ok_pairs.add(pair)
+            if unit:
+                idx.scanned_units.add(unit)
+            ver = model_file_version(fp) if hash_files and fp else ""
+            if ver:
+                idx.pair_versions[pair] = ver
+                idx.pair_files[pair] = fp
+                idx.files_info.append({"unit": unit, "discipline": disc,
+                                       "file": fp, "version": ver})
+        else:
+            idx.failed_pairs.add(pair)
+            if unit:
+                idx.failed_units.add(unit)
+            idx.failed_files.append({"unit": unit, "discipline": disc,
+                                     "file": fp,
+                                     "error": getattr(f, "error", "")})
+    return idx
+
+
+def _ticket_version_map(t: CollabTicket, idx: _ScanIndices) -> dict[str, str]:
+    ver_map: dict[str, str] = {}
+    for unit, disc in _ticket_scan_pairs(t):
+        ver = idx.pair_versions.get((unit, disc))
+        if ver:
+            ver_map[f"{unit}|{idx.pair_files.get((unit, disc), '')}"] = ver
+    return ver_map
+
+
+def _sweep_with_coverage(ledger: CollabLedger, present: set[str],
+                         sources: set[str], batch_id: str, *,
+                         scope: ScanScope, idx: _ScanIndices,
+                         now: str) -> dict:
+    """覆盖感知的自动销项，返回分类统计（changed/auto_verified/...）。
+
+    只处理 sources 内、活动、本批未检出的工单，按覆盖结论分流：
+
+    * covered：范围内且依赖模型全部扫描成功 -> 待复核自动通过 / 其余标已消除；
+    * scan_failed：范围内但模型扫描失败 -> 保留，记 ``scan_failed`` 流转；
+    * out_of_scope：不在本次复查范围 -> 保留，仅更新覆盖留痕字段。
+    """
+    stats = {"changed": [], "auto_verified": [], "auto_cleared": [],
+             "scan_failed": [], "out_of_scope": []}
+    scope_note = f"（复查范围：{scope.describe()}）" if scope.partial else ""
     for key, t in ledger.tickets.items():
         if t.source not in sources or t.source == SOURCE_MANUAL:
             continue
-        if key in present or not t.active:
+        if not t.active:
             continue
+        if key in present:
+            continue
+        result = ticket_cover_result(t, scope, idx)
+        if result == COVER_OUT_OF_SCOPE:
+            t.last_cover_result = COVER_OUT_OF_SCOPE
+            t.last_cover_batch = batch_id
+            t.last_cover_at = now
+            stats["out_of_scope"].append(t)
+            continue
+        if result == COVER_SCAN_FAILED:
+            t.last_scan_batch = batch_id
+            t.last_scan_at = now
+            t.last_cover_result = COVER_SCAN_FAILED
+            t.last_cover_batch = batch_id
+            t.last_cover_at = now
+            already = any(h.get("action") == "scan_failed"
+                          and h.get("batch_id") == batch_id for h in t.history)
+            if not already:
+                pair_units = {u for u, _ in _ticket_scan_pairs(t)}
+                failed = "、".join(
+                    f"{f['unit'] or f['file']}（{f['error'] or '扫描失败'}）"
+                    for f in idx.failed_files
+                    if (f["unit"], f["discipline"]) in _ticket_scan_pairs(t)
+                    or f["unit"] in pair_units)
+                _record(t, "scan_failed", t.status, t.status, SYSTEM_ACTOR,
+                        "范围内模型扫描失败，不予自动销项，工单状态保留"
+                        + (f"：{failed}" if failed else "") + scope_note,
+                        batch_id, at=now)
+            stats["scan_failed"].append(t)
+            continue
+        # covered：成功覆盖且未再检出 -> 自动销项
+        versions = _ticket_version_map(t, idx)
+        if versions:
+            t.last_scan_versions = versions
+            t.cleared_versions = {**t.cleared_versions, **versions}
+        t.last_scan_batch = batch_id
+        t.last_scan_at = now
+        t.last_cover_result = COVER_COVERED
+        t.last_cover_batch = batch_id
+        t.last_cover_at = now
         if t.status == STATUS_FIXED:
             _record(t, "auto_verify", STATUS_FIXED, STATUS_VERIFIED,
-                    SYSTEM_ACTOR, "重新核查未再检出，自动复核通过",
-                    batch_id, at=now)
+                    SYSTEM_ACTOR,
+                    "重新核查未再检出，自动复核通过" + scope_note,
+                    batch_id, at=now,
+                    extra={"versions": versions} if versions else None)
             t.status = STATUS_VERIFIED
             t.verified_by = t.verified_by or SYSTEM_ACTOR
             t.verified_at = now
             notify(ledger, t, EVENT_VERIFIED,
                    body=f"工单 {t.ticket_id} 整改后重新核查未检出，自动闭环",
                    recipients=_owner_and_leads(ledger, t), at=now)
+            stats["auto_verified"].append(t)
         else:
             _record(t, "auto_clear", t.status, STATUS_CLEARED, SYSTEM_ACTOR,
-                    "重新核查未再检出，问题在模型中已消失", batch_id, at=now)
+                    "重新核查未再检出，问题在模型中已消失" + scope_note,
+                    batch_id, at=now,
+                    extra={"versions": versions} if versions else None)
             t.status = STATUS_CLEARED
-        changed.append(t)
-    return changed
+            stats["auto_cleared"].append(t)
+        stats["changed"].append(t)
+    return stats
+
+
+def _record_scan_run(ledger: CollabLedger, batch_id: str, now: str, *,
+                     scope: ScanScope, idx: _ScanIndices, present: set[str],
+                     stats: dict) -> ScanRun:
+    """汇总本次复查的实际范围 / 版本 / 覆盖结果，登记 ScanRun 并发通知。"""
+    uncovered = [t.ticket_id for t in (stats["out_of_scope"]
+                                       + stats["scan_failed"])]
+    run = ScanRun(
+        batch_id=batch_id, at=now,
+        units=sorted(scope.units), disciplines=sorted(scope.disciplines),
+        kinds=sorted(scope.kinds),
+        scoped=scope.partial,
+        partial=scope.partial or bool(idx.failed_files)
+        or bool(stats["out_of_scope"]),
+        scanned_units=sorted(idx.scanned_units),
+        failed_files=list(idx.failed_files),
+        model_versions=list(idx.files_info),
+        n_present=len(present),
+        n_covered=len(stats["auto_verified"]) + len(stats["auto_cleared"]),
+        n_auto_verified=len(stats["auto_verified"]),
+        n_auto_cleared=len(stats["auto_cleared"]),
+        n_out_of_scope=len(stats["out_of_scope"]),
+        n_scan_failed=len(stats["scan_failed"]),
+        uncovered_ticket_ids=uncovered,
+    )
+    # note 记录申请范围（展示用）；partial 反映实际覆盖是否完整
+    if scope.partial:
+        run.note = scope.describe()
+    elif run.partial:
+        run.note = "全量复查（含扫描失败 / 缺失单体）"
+    else:
+        run.note = "全量复查"
+    ledger.add_run(run)
+    if run.incomplete:
+        _notify_scan_incomplete(ledger, run)
+    return run
+
+
+def _notify_scan_incomplete(ledger: CollabLedger, run: ScanRun) -> None:
+    """局部复查存在未覆盖工单 / 扫描失败模型时，通知协调与各专业负责人。"""
+    scope_label = "局部复查" if run.scoped else "全量复查"
+    parts = [f"批次 {run.batch_id} {scope_label}覆盖不完整（{run.note}）"]
+    if run.failed_files:
+        names = "、".join(
+            f"{f['unit'] or f['file']}" for f in run.failed_files[:10])
+        parts.append(f"扫描失败模型 {len(run.failed_files)} 个（{names}），"
+                     f"相关 {run.n_scan_failed} 张工单保留状态")
+    if run.n_out_of_scope:
+        parts.append(f"{run.n_out_of_scope} 张工单不在本次复查范围，状态保留")
+    message = "；".join(parts) + "。仅成功覆盖且未再检出的问题已自动销项。"
+    # 同一批次同消息不重复通知
+    if any(n.event == EVENT_SCAN_INCOMPLETE and not n.ticket_id
+           and n.body == message for n in ledger.notifications[-200:]):
+        return
+    leads = []
+    for role in (ROLE_COORDINATOR, ROLE_DESIGN_LEAD,
+                 ROLE_STRUCT_LEAD, ROLE_MEP_LEAD):
+        leads += [u.name for u in ledger.users_by_role(role)]
+    notify(ledger, None, EVENT_SCAN_INCOMPLETE, body=message,
+           recipients=sorted(set(leads)) or None, role=ROLE_COORDINATOR,
+           at=run.at)
+
+
+def sweep_absent_tickets(ledger: CollabLedger, present: set[str],
+                         sources: set[str], batch_id: str,
+                         now: Optional[str] = None) -> list[CollabTicket]:
+    """本批重新核查未检出的活动工单自动闭环；人工登记问题不自动消除。
+
+    全量复查语义（无范围、无失败模型）的便捷封装；带范围 / 失败模型的场景由
+    :func:`ingest_batch` 内部的覆盖感知销项处理。
+    """
+    now = now or _now()
+    stats = _sweep_with_coverage(
+        ledger, present, sources, batch_id,
+        scope=ScanScope(), idx=_ScanIndices(), now=now)
+    return stats["changed"]
 
 
 def ingest_rule_violations(ledger: CollabLedger, violations: list[dict],
@@ -953,6 +1459,26 @@ def collab_summary(ledger: CollabLedger, now: Optional[datetime] = None) -> dict
     total = len(ledger.tickets)
     active = sum(by_status[s] for s in COLLAB_ACTIVE_STATUSES)
     closed = total - active
+    last = ledger.last_run()
+    last_scan = None
+    if last is not None:
+        live_uncovered = [tid for tid in last.uncovered_ticket_ids
+                          if _active_ticket(ledger, tid)]
+        last_scan = {
+            "batch_id": last.batch_id,
+            "at": last.at,
+            "scoped": last.scoped,
+            "partial": last.partial,
+            "scope": last.note,
+            "scanned_units": list(last.scanned_units),
+            "failed_files": list(last.failed_files),
+            "n_auto_verified": last.n_auto_verified,
+            "n_auto_cleared": last.n_auto_cleared,
+            "n_out_of_scope": last.n_out_of_scope,
+            "n_scan_failed": last.n_scan_failed,
+            "uncovered_active": live_uncovered,
+            "model_versions": list(last.model_versions),
+        }
     return {
         "project": ledger.project,
         "updated_at": ledger.updated_at,
@@ -970,6 +1496,7 @@ def collab_summary(ledger: CollabLedger, now: Optional[datetime] = None) -> dict
         "closed_breakdown": close_counts,
         "avg_fix_hours": round(sum(fix_durations) / len(fix_durations), 1)
         if fix_durations else None,
+        "last_scan": last_scan,
     }
 
 
@@ -1006,6 +1533,7 @@ def build_writeback(ledger: CollabLedger, batch_id: str = "") -> dict:
         "by_status": summ["by_status"],
         "by_source": summ["by_source"],
         "active_by_owner_discipline": summ["active_by_owner_discipline"],
+        "last_scan": summ["last_scan"],
         "per_unit": sorted(per_unit.values(), key=lambda r: r["unit"]),
     }
 
@@ -1034,6 +1562,10 @@ class CollabGate:
     max_no_owner: int = -1           # 未指派责任人（默认不限制，strict 才强制）
     fix_sla_hours: float = 72.0
     require_writeback: bool = False  # 报整改是否必须有整改回写说明
+    # 局部复查：最近一次扫描未覆盖（范围外 / 扫描失败）的活动工单，默认告警不阻断；
+    # strict 要求复查覆盖完整（=0）才放行；-2=完全不检查
+    max_uncovered_active: int = -1
+    block_on_scan_failed: bool = False  # 存在扫描失败模型时是否阻断（strict=True）
 
     @property
     def enabled(self) -> bool:
@@ -1041,21 +1573,26 @@ class CollabGate:
 
 
 _COLLAB_GATE_PROFILES = {
-    # 标准：只卡超期；问题数量交质量/协同门禁，是否到人交 strict，避免重复执法
+    # 标准：只卡超期；问题数量交质量/协同门禁，是否到人交 strict，避免重复执法。
+    # 局部复查不完整只告警（未覆盖/失败保留的工单不计入自动放行）。
     "default": {"max_active": -1, "max_active_errors": -1,
                 "max_overdue": 0, "max_pending_review": -1,
                 "max_no_owner": -1, "fix_sla_hours": 72.0,
-                "require_writeback": False},
+                "require_writeback": False,
+                "max_uncovered_active": -1, "block_on_scan_failed": False},
     "strict": {"max_active": 0, "max_active_errors": 0, "max_overdue": 0,
                "max_pending_review": 0, "max_no_owner": 0,
-               "fix_sla_hours": 48.0, "require_writeback": True},
+               "fix_sla_hours": 48.0, "require_writeback": True,
+               "max_uncovered_active": 0, "block_on_scan_failed": True},
     "loose": {"max_active": -1, "max_active_errors": -1,
               "max_overdue": -1, "max_pending_review": -1,
               "max_no_owner": -1, "fix_sla_hours": 168.0,
-              "require_writeback": False},
+              "require_writeback": False,
+              "max_uncovered_active": -2, "block_on_scan_failed": False},
     "none": {"max_active": -1, "max_active_errors": -1, "max_overdue": -1,
              "max_pending_review": -1, "max_no_owner": -1,
-             "fix_sla_hours": 72.0, "require_writeback": False},
+             "fix_sla_hours": 72.0, "require_writeback": False,
+             "max_uncovered_active": -2, "block_on_scan_failed": False},
 }
 
 COLLAB_GATE_PROFILES = tuple(_COLLAB_GATE_PROFILES)
@@ -1074,10 +1611,27 @@ def for_gate_profile(name: str = "default") -> CollabGate:
     return CollabGate(**_COLLAB_GATE_PROFILES[name])
 
 
+def _active_ticket(ledger: CollabLedger, ticket_id: str) -> Optional[CollabTicket]:
+    """按工单号取活动工单（历史记录中的已闭环工单返回 None）。"""
+    try:
+        t = ledger.find(ticket_id)
+    except KeyError:
+        return None
+    return t if t.active else None
+
+
 def evaluate_collab_gate(ledger: CollabLedger, gate: CollabGate,
                          batch_id: str = "",
                          notify_block: bool = True) -> tuple[bool, list[dict]]:
-    """按闭环门禁评估，返回 (是否通过, 逐条判定)。未通过时投递门禁阻断通知。"""
+    """按闭环门禁评估，返回 (是否通过, 逐条判定)。未通过时投递门禁阻断通知。
+
+    局部复查联动：取台账最近一次复查记录（:class:`ScanRun`）——
+
+    * ``max_uncovered_active``：最近扫描未覆盖（范围外 / 扫描失败）的活动
+      工单数；default 下为 **0 阈值但不阻断的告警项**，strict 下必须为 0；
+    * ``block_on_scan_failed``：最近扫描存在失败模型，strict 下阻断，
+      防止“没扫到”被当成“已整改”放行。
+    """
     now = datetime.now()
     summ = collab_summary(ledger, now)
     active = [t for t in ledger.tickets.values() if t.active]
@@ -1090,6 +1644,18 @@ def evaluate_collab_gate(ledger: CollabLedger, gate: CollabGate,
                          if gate.require_writeback and t.status == STATUS_FIXED
                          and not t.resolution)
 
+    # 最近一次复查（局部复查）覆盖情况；按当前活动工单复核未覆盖集合，
+    # 避免上一批次的未覆盖记录干扰本批次全量复查后的结论
+    last = ledger.last_run()
+    n_uncovered = n_scan_failed_files = 0
+    run_batch = ""
+    if last is not None:
+        run_batch = last.batch_id
+        n_scan_failed_files = len(last.failed_files)
+        # 按当前活动工单复核未覆盖集合，避免已闭环 / 已重开工单干扰
+        n_uncovered = sum(1 for tid in last.uncovered_ticket_ids
+                          if _active_ticket(ledger, tid))
+
     checks = [
         ("max_active", n_active, f"未闭环工单 {n_active} 项", "int"),
         ("max_active_errors", n_errors, f"未闭环错误级工单 {n_errors} 项", "int"),
@@ -1098,24 +1664,47 @@ def evaluate_collab_gate(ledger: CollabLedger, gate: CollabGate,
         ("max_no_owner", n_no_owner, f"未指派责任人工单 {n_no_owner} 项", "int"),
         ("require_writeback", n_no_writeback,
          f"待复核但缺少整改回写说明 {n_no_writeback} 项", "bool"),
+        ("max_uncovered_active", n_uncovered,
+         f"本次复查未覆盖活动工单 {n_uncovered} 项"
+         + (f"（批次 {run_batch}）" if run_batch and run_batch != batch_id
+            else ""), "int_advisory"),
+        ("block_on_scan_failed", n_scan_failed_files,
+         f"扫描失败模型 {n_scan_failed_files} 个", "bool"),
     ]
     rules: list[dict] = []
     passed_all = True
     for key, actual, shown, unit in checks:
-        value = getattr(gate, key)
         if unit == "bool":
+            value = getattr(gate, key)
             if not value:
                 continue
             ok = actual == 0
-            limit = "回写必须齐全"
+            limit = "必须为 0"
+        elif unit == "int_advisory":
+            # 局部复查覆盖度：-2=不检查；-1=检查但仅告警（default，不阻断）；
+            # >=0=数值限值，超限阻断（strict=0）
+            value = getattr(gate, key)
+            if value < -1:
+                continue
+            if value == -1:
+                # 仅告警：有未覆盖工单时列一条提示规则，但不影响放行
+                if actual <= 0:
+                    continue
+                ok = True
+                limit = "仅告警（不阻断放行）"
+            else:
+                ok = actual <= value
+                limit = f"≤ {value:g}"
         else:
+            value = getattr(gate, key)
             if value < 0:
                 continue
             ok = actual <= value
             limit = f"≤ {value:g}"
         passed_all = passed_all and ok
         rules.append({"key": key, "actual": shown, "limit": limit,
-                      "passed": ok,
+                      "passed": ok, "advisory": unit == "int_advisory"
+                      and getattr(gate, key, -2) == -1,
                       "message": ("" if ok else f"{shown}，门禁要求 {limit}")})
     passed = (not gate.enabled) or passed_all
     if not passed and notify_block:

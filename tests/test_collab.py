@@ -22,7 +22,8 @@ from ifc_audit.collab import (                                       # noqa: E40
     open_manual_ticket, assign_ticket, fix_ticket, verify_ticket,
     reject_ticket, close_ticket, writeback_fix, locate_ticket,
     collab_summary, evaluate_collab_gate, for_gate_profile,
-    upsert_user, build_writeback,
+    upsert_user, build_writeback, ScanScope, ticket_cover_result,
+    model_file_version,
 )
 from ifc_audit.collab_model import (                                 # noqa: E402
     CollabLedger, ModelRef,
@@ -288,6 +289,207 @@ def run() -> int:
         check(all(isinstance(r, ModelRef)
                   for t in back.tickets.values() for r in t.refs),
               "构件引用反序列化为 ModelRef")
+
+    # --------------------------------------- 局部复查：范围 / 版本 / 销项 ----
+    from types import SimpleNamespace
+
+    def _issue(kind, gid, iid, storey="1F"):
+        return SimpleNamespace(kind=kind, severity="error",
+                               title=f"{kind}-{gid}", detail="",
+                               global_ids=[gid], storey=storey,
+                               location=(0.0, 0.0), measure=0, issue_id=iid)
+
+    def _unit(name, issues, ok=True, error="", path=None):
+        model = SimpleNamespace(issues=issues) if ok else None
+        return SimpleNamespace(name=name, model=model,
+                               file_path=path or f"/{name}.ifc",
+                               ok=ok, error=error)
+
+    def _batch(units, bid, coord=None):
+        return SimpleNamespace(batch_id=bid, units=units, coordination=coord)
+
+    ledr = _ledger()
+    # B1 全量：U1 墙端 GA、U2 墙端 GB、U2 重复 GC
+    ingest_batch(ledr, _batch([
+        _unit("U1", [_issue("wall_free_end", "GA", "GAP-1")]),
+        _unit("U2", [_issue("wall_free_end", "GB", "GAP-2"),
+                     _issue("duplicate_element", "GC", "DUP-1")]),
+    ], "B1"), sla_hours=0)
+    by_gid = {r.global_id: t for t in ledr.tickets.values()
+              for r in t.refs}
+
+    # 1) 范围描述与别名展开
+    sc = ScanScope.make(units=["U1"], kinds=["wall"])
+    check(sc.partial and "wall_end_gap" in sc.kinds
+          and "room_no_geometry" in sc.kinds,
+          "复查范围：wall 别名展开为墙体/围护类核查项")
+    check("U1" in sc.describe(), "范围描述包含单体")
+
+    # 2) 只复查 U1（成功且已无问题）：GA 自动消除；GB/GC 范围外保留
+    ingest_batch(ledr, _batch([_unit("U1", [])], "B2"),
+                 sla_hours=0, scope=ScanScope.make(units=["U1"]))
+    check(by_gid["GA"].status == STATUS_CLEARED
+          and by_gid["GA"].last_cover_result == "covered",
+          "范围内成功覆盖且未检出 -> 自动消除并记 covered")
+    check(by_gid["GB"].status == STATUS_OPEN
+          and by_gid["GB"].last_cover_result == "out_of_scope",
+          "范围外活动工单保留状态，标记 out_of_scope")
+    run = ledr.last_run()
+    check(run.partial and run.n_auto_cleared == 1
+          and run.n_out_of_scope == 2 and run.n_scan_failed == 0
+          and not run.failed_files,
+          "复查记录：局部范围 + 自动销项/范围外计数正确")
+    check(all(v["version"] for v in run.model_versions)
+          and run.model_versions[0]["unit"] == "U1",
+          "复查记录模型版本（大小-内容指纹）已留痕")
+    check(by_gid["GA"].last_scan_versions
+          and by_gid["GA"].cleared_versions,
+          "销项工单记录复查模型版本（可追溯销项依据）")
+    check(by_gid["GB"].last_scan_batch == "B1"
+          and by_gid["GB"].last_cover_batch == "B2",
+          "范围外工单保留首次扫描批次戳，复查只记覆盖结论不盖新戳")
+
+    # 3) 范围含 U2 但 U2 扫描失败：GB/GC 保留并标 scan_failed
+    ingest_batch(ledr, _batch([_unit("U2", [], ok=False,
+                                    error="IFC 解析失败")], "B3"),
+                 sla_hours=0, scope=ScanScope.make(units=["U2"]))
+    check(by_gid["GB"].status == STATUS_OPEN
+          and by_gid["GB"].last_cover_result == "scan_failed",
+          "范围内模型扫描失败 -> 工单保留并标 scan_failed")
+    check(any(h["action"] == "scan_failed" for h in by_gid["GB"].history),
+          "扫描失败写入工单流转记录")
+    run3 = ledr.last_run()
+    check(len(run3.failed_files) == 1
+          and run3.failed_files[0]["error"] == "IFC 解析失败"
+          and run3.n_scan_failed == 2,
+          "复查记录登记失败文件（单体/专业/文件/错误）")
+    # 同一批次重复扫描失败不重复写流转记录
+    ingest_batch(ledr, _batch([_unit("U2", [], ok=False,
+                                    error="IFC 解析失败")], "B3"),
+                 sla_hours=0, scope=ScanScope.make(units=["U2"]))
+    n_fail_hist = sum(1 for h in by_gid["GB"].history
+                      if h["action"] == "scan_failed")
+    check(n_fail_hist == 1, "同批次扫描失败流转记录幂等，不重复留痕")
+
+    # 4) 按核查项局部复查：只扫 duplicate -> GC 消除；GB 属 wall 保留
+    ingest_batch(ledr, _batch([_unit("U2", [])], "B4"), sla_hours=0,
+                 scope=ScanScope.make(units=["U2"], kinds=["duplicate"]))
+    check(by_gid["GC"].status == STATUS_CLEARED,
+          "核查项范围内问题未检出 -> 自动消除")
+    check(by_gid["GB"].status == STATUS_OPEN
+          and by_gid["GB"].last_cover_result == "out_of_scope",
+          "核查项范围外（wall）问题保留")
+
+    # 5) 全量复查全部成功且无问题 -> GB 自动消除，覆盖完整
+    ingest_batch(ledr, _batch([_unit("U1", []), _unit("U2", [])], "B5"),
+                 sla_hours=0)
+    check(by_gid["GB"].status == STATUS_CLEARED
+          and by_gid["GB"].last_cover_result == "covered",
+          "全量复查成功覆盖 -> 剩余工单自动销项")
+    check(not ledr.last_run().incomplete
+          and ledr.last_run().n_out_of_scope == 0
+          and ledr.last_run().n_scan_failed == 0,
+          "全量复查覆盖完整：无范围外/失败保留")
+
+    # 6) 通知：局部复查覆盖不完整时通知协调 / 专业负责人
+    ledn = _ledger()
+    ingest_batch(ledn, _batch([
+        _unit("U1", [_issue("wall_free_end", "NA", "GAP-9")])], "N1"),
+        sla_hours=0)
+    ingest_batch(ledn, _batch([_unit("U2", [])], "N2"), sla_hours=0,
+                 scope=ScanScope.make(units=["U2"]))
+    from ifc_audit.collab_model import EVENT_SCAN_INCOMPLETE
+    check(any(n.event == EVENT_SCAN_INCOMPLETE
+              for n in ledn.notifications),
+          "局部复查存在未覆盖工单 -> 投递复查覆盖不完整通知")
+
+    # 7) 门禁联动：default 告警不阻断；strict 未覆盖/失败阻断
+    ledg = _ledger()
+    ingest_batch(ledg, _batch([
+        _unit("U1", [_issue("wall_free_end", "GA", "GAP-1")])], "G1"),
+        sla_hours=0)
+    ingest_batch(ledg, _batch([_unit("U2", [])], "G2"), sla_hours=0,
+                 scope=ScanScope.make(units=["U2"]))
+    ok_d, rules_d = evaluate_collab_gate(
+        ledg, for_gate_profile("default"), "G2", notify_block=False)
+    adv = [r for r in rules_d if r["key"] == "max_uncovered_active"]
+    check(ok_d and adv and adv[0]["passed"] and adv[0].get("advisory"),
+          "default 门禁：局部复查未覆盖只告警、不阻断放行")
+    ok_s, rules_s = evaluate_collab_gate(
+        ledg, for_gate_profile("strict"), "G2", notify_block=False)
+    check(not ok_s
+          and any(r["key"] == "max_uncovered_active" and not r["passed"]
+                  for r in rules_s),
+          "strict 门禁：存在未覆盖活动工单即阻断")
+    ledf = _ledger()
+    ingest_batch(ledf, _batch([
+        _unit("U1", [_issue("wall_free_end", "FA", "GAP-7")])], "F1"),
+        sla_hours=0)
+    ingest_batch(ledf, _batch(
+        [_unit("U1", [], ok=False, error="损坏")], "F2"), sla_hours=0,
+        scope=ScanScope.make(units=["U1"]))
+    ok_sf, rules_sf = evaluate_collab_gate(
+        ledf, for_gate_profile("strict"), "F2", notify_block=False)
+    check(not ok_sf
+          and any(r["key"] == "block_on_scan_failed" and not r["passed"]
+                  for r in rules_sf),
+          "strict 门禁：扫描失败模型阻断（防止“没扫到”被当成“已整改”）")
+
+    # 8) 待复核工单在局部成功覆盖后自动复核通过
+    ledv = _ledger()
+    ingest_batch(ledv, _batch([
+        _unit("U1", [_issue("wall_free_end", "VA", "GAP-3")])], "V1"),
+        sla_hours=0)
+    tv = next(iter(ledv.tickets.values()))
+    fix_ticket(ledv, tv.ticket_id, "王设", "已整改")
+    ingest_batch(ledv, _batch([_unit("U1", [])], "V2"), sla_hours=0,
+                 scope=ScanScope.make(units=["U1"]))
+    check(ledv.find(tv.ticket_id).status == STATUS_VERIFIED,
+          "待复核工单局部复查成功覆盖且未检出 -> 自动复核通过")
+
+    # 9) 历史台账兼容：旧 v1 台账（无复查字段）可加载，汇总不报错
+    with tempfile.TemporaryDirectory() as td:
+        old = {
+            "schema_version": 1, "project": "老项目", "updated_at": "",
+            "tickets": [{
+                "ticket_id": "COLL-0001",
+                "fingerprint": "fp:old1", "source": "audit",
+                "kind": "wall_free_end", "severity": "error",
+                "title": "老工单", "status": "open",
+                "owner_discipline": "arch", "created_batch": "OLD",
+                "refs": [{"global_id": "G", "discipline": "arch",
+                          "unit": "U1"}],
+                "unit": "U1", "history": []}],
+            "users": [], "notifications": [],
+        }
+        p = os.path.join(td, "old.json")
+        with open(p, "w", encoding="utf-8") as f:
+            import json as _json
+            _json.dump(old, f, ensure_ascii=False)
+        old_led = CollabLedger.load(p)
+        check(old_led.runs == [] and old_led.SCHEMA_VERSION == 2,
+              "旧 v1 台账加载为空复查记录（兼容历史台账）")
+        check(collab_summary(old_led)["last_scan"] is None,
+              "旧台账汇总 last_scan=None 不报错")
+        # 一次新扫描后自动升级为 v2 并登记复查记录
+        ingest_batch(old_led, _batch([_unit("U1", [])], "NEW"), sla_hours=0)
+        old_led.save(p)
+        upgraded = CollabLedger.load(p)
+        check(upgraded.runs and upgraded.runs[0].batch_id == "NEW",
+              "旧台账重新扫描后升级 schema 并补登记复查记录")
+        check(upgraded.find("COLL-0001").status == STATUS_CLEARED,
+              "旧台账中覆盖后消失的老工单正常自动销项")
+
+    # 10) 模型版本：文件变化版本随之变化
+    with tempfile.TemporaryDirectory() as td:
+        f1 = os.path.join(td, "m.ifc")
+        with open(f1, "wb") as f:
+            f.write(b"IFC v1 content")
+        v1 = model_file_version(f1)
+        with open(f1, "wb") as f:
+            f.write(b"IFC v2 content changed")
+        v2 = model_file_version(f1)
+        check(v1 != v2, "模型文件内容变化 -> 版本指纹变化")
 
     # --------------------------------------- 批量审查端到端纳管 ----
     try:

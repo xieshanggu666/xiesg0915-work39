@@ -52,9 +52,10 @@ __all__ = [
     "EVENT_CREATED", "EVENT_ASSIGNED", "EVENT_DUE_SOON", "EVENT_OVERDUE",
     "EVENT_ESCALATED", "EVENT_FIXED", "EVENT_REJECTED", "EVENT_VERIFIED",
     "EVENT_CLOSED", "EVENT_REOPENED", "EVENT_MENTION", "EVENT_GATE_BLOCKED",
+    "EVENT_SCAN_INCOMPLETE",
     "EVENT_CN",
     "CollabTicket", "ModelRef", "RosterUser", "Notification",
-    "CollabLedger", "make_ticket_fingerprint",
+    "ScanRun", "CollabLedger", "make_ticket_fingerprint",
 ]
 
 # ------------------------------------------------------------- 问题来源 ----
@@ -155,6 +156,8 @@ EVENT_CLOSED = "closed"
 EVENT_REOPENED = "reopened"
 EVENT_MENTION = "mention"
 EVENT_GATE_BLOCKED = "gate_blocked"
+# 局部复查 / 扫描失败：存在未覆盖工单，自动销项范围受限
+EVENT_SCAN_INCOMPLETE = "scan_incomplete"
 
 EVENT_CN = {
     EVENT_CREATED: "新问题派单",
@@ -169,6 +172,7 @@ EVENT_CN = {
     EVENT_REOPENED: "回归重开",
     EVENT_MENTION: "点名提醒",
     EVENT_GATE_BLOCKED: "门禁阻断",
+    EVENT_SCAN_INCOMPLETE: "复查覆盖不完整",
 }
 
 # 事件默认严重程度（通知中心着色用）
@@ -185,6 +189,7 @@ EVENT_LEVEL = {
     EVENT_REOPENED: "error",
     EVENT_MENTION: "info",
     EVENT_GATE_BLOCKED: "error",
+    EVENT_SCAN_INCOMPLETE: "warning",
 }
 
 
@@ -278,6 +283,19 @@ class CollabTicket:
 
     # 重新核查时本批是否仍检出（瞬态，不持久化为 True）
     present_in_scan: bool = False
+
+    # 局部复查留痕：最近一次扫描的批次 / 时刻 / 模型版本（不区分是否检出）
+    last_scan_batch: str = ""
+    last_scan_at: str = ""
+    # 最近一次确认覆盖该工单的扫描所用模型版本（按 "单体|文件" -> 版本）
+    last_scan_versions: dict[str, str] = field(default_factory=dict)
+    # 最近一次覆盖结果：covered=成功覆盖；out_of_scope=不在复查范围；
+    # scan_failed=范围内但模型扫描失败；manual/rule 类不参与自动覆盖
+    last_cover_result: str = ""
+    last_cover_batch: str = ""
+    last_cover_at: str = ""
+    # 自动销项时所依据的模型版本（已消除 / 自动复核通过留痕）
+    cleared_versions: dict[str, str] = field(default_factory=dict)
 
     # ---- 状态判定 ----
     @property
@@ -418,6 +436,63 @@ class Notification:
                       if k in cls.__dataclass_fields__})
 
 
+# ------------------------------------------------------- 复查运行记录 ----
+
+# 覆盖判定结果
+COVER_COVERED = "covered"             # 在复查范围内且模型扫描成功
+COVER_OUT_OF_SCOPE = "out_of_scope"  # 不在本次复查范围（单体 / 专业 / 核查项）
+COVER_SCAN_FAILED = "scan_failed"    # 在范围内但对应模型扫描失败
+COVER_PRESENT = "present"            # 本次扫描仍检出（未消失，无需销项）
+
+COVER_CN = {
+    COVER_COVERED: "成功覆盖",
+    COVER_OUT_OF_SCOPE: "不在复查范围",
+    COVER_SCAN_FAILED: "扫描失败",
+    COVER_PRESENT: "仍检出",
+}
+
+
+@dataclass
+class ScanRun:
+    """一次（局部）复查的实际扫描范围与覆盖结果留痕。"""
+
+    batch_id: str
+    at: str
+    # 申请的复查范围（空=全量）
+    units: list[str] = field(default_factory=list)
+    disciplines: list[str] = field(default_factory=list)
+    kinds: list[str] = field(default_factory=list)
+    # 是否用户显式圈定了复查范围（区别于全量但有模型扫描失败）
+    scoped: bool = False
+    partial: bool = False
+    # 实际扫描结果
+    scanned_units: list[str] = field(default_factory=list)   # 成功扫描的单体
+    failed_files: list[dict] = field(default_factory=list)  # {unit,discipline,file,error}
+    model_versions: list[dict] = field(default_factory=list)  # {unit,discipline,file,version}
+    # 覆盖统计（活动 audit/coord 工单）
+    n_present: int = 0           # 本次仍检出
+    n_covered: int = 0           # 范围覆盖且未检出（含自动销项）
+    n_auto_verified: int = 0     # 待复核 -> 自动复核通过
+    n_auto_cleared: int = 0      # 待整改/驳回 -> 已消除
+    n_out_of_scope: int = 0      # 范围外，状态保留
+    n_scan_failed: int = 0       # 范围内但扫描失败，状态保留
+    uncovered_ticket_ids: list[str] = field(default_factory=list)  # 未覆盖活动工单
+    note: str = ""
+
+    def to_dict(self) -> dict:
+        return asdict(self)
+
+    @classmethod
+    def from_dict(cls, d: dict) -> "ScanRun":
+        return cls(**{k: v for k, v in (d or {}).items()
+                      if k in cls.__dataclass_fields__})
+
+    @property
+    def incomplete(self) -> bool:
+        """存在未覆盖工单或扫描失败文件 -> 本次复查不完整。"""
+        return bool(self.failed_files) or bool(self.uncovered_ticket_ids)
+
+
 # ------------------------------------------------------------- 台账 ----
 
 @dataclass
@@ -428,9 +503,13 @@ class CollabLedger:
     tickets: dict[str, CollabTicket] = field(default_factory=dict)  # fp -> ticket
     users: dict[str, RosterUser] = field(default_factory=dict)      # 姓名 -> 用户
     notifications: list[Notification] = field(default_factory=list)
+    # 复查运行记录（最近在前；局部复查范围 / 模型版本 / 覆盖结果留痕）
+    runs: list[ScanRun] = field(default_factory=list)
     updated_at: str = ""
 
-    SCHEMA_VERSION = 1
+    SCHEMA_VERSION = 2
+    # 台账中保留的复查运行记录上限（超出截旧）
+    MAX_RUNS = 100
 
     # ---- 查询 ----
     def get(self, fingerprint: str) -> Optional[CollabTicket]:
@@ -481,6 +560,17 @@ class CollabLedger:
         self.notifications.append(n)
         return n
 
+    # ---- 复查运行记录 ----
+    def add_run(self, run: ScanRun) -> ScanRun:
+        """登记一次复查运行（最近在前，超出 :data:`MAX_RUNS` 截旧）。"""
+        self.runs.insert(0, run)
+        if len(self.runs) > self.MAX_RUNS:
+            del self.runs[self.MAX_RUNS:]
+        return run
+
+    def last_run(self) -> Optional[ScanRun]:
+        return self.runs[0] if self.runs else None
+
     def notifications_for(self, name: str, unread_only: bool = False
                           ) -> list[Notification]:
         out = []
@@ -503,6 +593,7 @@ class CollabLedger:
             "users": [u.to_dict() for u in sorted(self.users.values(),
                                                   key=lambda x: x.name)],
             "notifications": [n.to_dict() for n in self.notifications],
+            "scan_runs": [r.to_dict() for r in self.runs],
         }
 
     def save(self, path: str) -> str:
@@ -530,6 +621,11 @@ class CollabLedger:
                 ledger.users[u.name] = u
         for d in doc.get("notifications", []):
             ledger.notifications.append(Notification.from_dict(d))
+        # schema v2 起记录复查运行；历史台账（v1 / 无该键）加载为空，照常工作
+        for d in doc.get("scan_runs", []):
+            run = ScanRun.from_dict(d)
+            if run.batch_id:
+                ledger.runs.append(run)
         return ledger
 
     @classmethod

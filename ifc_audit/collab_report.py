@@ -17,7 +17,7 @@ import os
 
 from .collab_model import (
     CollabLedger, SOURCE_CN, SEVERITY_CN, STATUS_CN, STATUS_CLOSED,
-    DISCIPLINES, DISC_CN, ROLE_CN,
+    DISCIPLINES, DISC_CN, ROLE_CN, COVER_CN,
     COLLAB_CLOSED_STATUSES,
 )
 from . import collab
@@ -90,6 +90,28 @@ def export_collab_excel(ledger: CollabLedger, out_path: str,
         ("已自动升级", summ["escalated"]),
         ("未指派责任人", summ["no_owner"]),
     ]
+    ls = summ.get("last_scan")
+    if ls:
+        rows.append(None)
+        rows.append(("—— 最近一次复查 ——", ""))
+        rows.append(("复查类型 / 批次",
+                     ("局部复查" if ls["scoped"] else "全量复查")
+                     + f"（{ls['batch_id']}，{_fmt_dt(ls['at'])}）"))
+        rows.append(("复查范围", ls["scope"]))
+        rows.append(("成功扫描单体",
+                     f"{len(ls['scanned_units'])} 个："
+                     + "、".join(ls["scanned_units"])))
+        rows.append(("扫描失败模型",
+                     f"{len(ls['failed_files'])} 个"
+                     + ("（" + "、".join(f["unit"] or f["file"]
+                                        for f in ls["failed_files"]) + "）"
+                        if ls["failed_files"] else "")))
+        rows.append(("自动销项",
+                     f"复核通过 {ls['n_auto_verified']} / "
+                     f"已消除 {ls['n_auto_cleared']}"))
+        rows.append(("保留：范围外 / 扫描失败",
+                     f"{ls['n_out_of_scope']} / {ls['n_scan_failed']}"))
+        rows.append(("模型版本留痕", f"{len(ls['model_versions'])} 份"))
     rows.append(None)
     rows.append(("—— 按来源（总数 / 未闭环）——", ""))
     for s, d in SOURCE_CN.items():
@@ -125,6 +147,7 @@ def export_collab_excel(ledger: CollabLedger, out_path: str,
                "量化指标", "跨模型构件", "涉及专业",
                "整改时限h", "整改截止", "剩余/超期h", "升级",
                "整改说明(回写)", "关闭原因",
+               "最近覆盖", "覆盖批次/时间", "复查模型版本",
                "创建批次", "创建时间", "整改人/时间", "复核人/时间",
                "来源单号", "流转记录"]
     ws.append(headers)
@@ -141,6 +164,8 @@ def export_collab_excel(ledger: CollabLedger, out_path: str,
             f"{h.get('action', '')}:{h.get('note', '')}".strip()
             for h in t.history)
         rem = t.sla_remaining_hours()
+        ver = "；".join(f"{k.split('|', 1)[0]} {v[:10]}"
+                        for k, v in (t.last_scan_versions or {}).items())
         ws.append([
             t.ticket_id, SOURCE_CN.get(t.source, t.source),
             STATUS_CN.get(t.status, t.status), t.sla_status_cn(),
@@ -158,6 +183,10 @@ def export_collab_excel(ledger: CollabLedger, out_path: str,
             "-" if rem is None else (f"超期{-rem:g}" if rem < 0 else f"{rem:g}"),
             f"L{t.escalation_level}" if t.escalation_level else "-",
             t.resolution or "-", t.closed_reason or "-",
+            COVER_CN.get(t.last_cover_result, "-") if t.last_cover_result else "-",
+            (f"{t.last_cover_batch} {_fmt_dt(t.last_cover_at)}".strip()
+             if t.last_cover_batch else "-"),
+            ver or "-",
             t.created_batch, _fmt_dt(t.created_at),
             (f"{t.fixed_by} {_fmt_dt(t.fixed_at)}".strip()
              if t.fixed_by else "-"),
@@ -207,6 +236,31 @@ def export_collab_excel(ledger: CollabLedger, out_path: str,
     _style_header(ws, 5)
     _autosize(ws)
 
+    # 5) 复查记录（范围 / 实际扫描 / 模型版本 / 覆盖结果）
+    if ledger.runs:
+        ws = wb.create_sheet("复查记录")
+        ws.append(["批次", "时间", "类型", "复查范围",
+                   "成功扫描单体", "扫描失败模型", "模型版本",
+                   "仍检出", "自动复核通过", "自动消除",
+                   "范围外保留", "扫描失败保留", "未覆盖工单"])
+        for r in ledger.runs:
+            failed = "；".join(
+                f"{f['unit'] or f['file']}（{f['error'] or '失败'}）"
+                for f in r.failed_files)
+            vers = "；".join(
+                f"{v['unit']}[{DISC_CN.get(v['discipline'], v['discipline'])}]"
+                f" {v['version'][:12]}" for v in r.model_versions)
+            ws.append([
+                r.batch_id, _fmt_dt(r.at),
+                "局部" if r.scoped else "全量", r.note,
+                "、".join(r.scanned_units), failed, vers,
+                r.n_present, r.n_auto_verified, r.n_auto_cleared,
+                r.n_out_of_scope, r.n_scan_failed,
+                "、".join(r.uncovered_ticket_ids),
+            ])
+        _style_header(ws, 13, fill="548235")
+        _autosize(ws)
+
     if gate_rules:
         ws.append([])
         ws.append(["闭环门禁规则", "限值", "实际值", "判定", "说明"])
@@ -234,7 +288,9 @@ def export_tickets_csv(ledger: CollabLedger, out_path: str) -> str:
                     "问题类型", "标题", "责任专业", "责任人", "单体", "楼层",
                     "x", "y", "z", "涉及构件GlobalId", "涉及文件",
                     "整改时限h", "整改截止", "剩余或超期h", "升级级别",
-                    "整改说明", "关闭原因", "创建批次", "创建时间",
+                    "整改说明", "关闭原因",
+                    "最近覆盖", "覆盖批次", "覆盖时间", "复查模型版本",
+                    "创建批次", "创建时间",
                     "整改人", "整改时间", "复核人", "复核时间",
                     "来源单号", "详细说明"])
         for t in _ordered_tickets(ledger):
@@ -252,6 +308,10 @@ def export_tickets_csv(ledger: CollabLedger, out_path: str) -> str:
                 t.sla_hours or "", _fmt_dt(t.due_at),
                 "" if rem is None else round(rem, 1),
                 t.escalation_level, t.resolution, t.closed_reason,
+                COVER_CN.get(t.last_cover_result, "") if t.last_cover_result else "",
+                t.last_cover_batch, _fmt_dt(t.last_cover_at),
+                ";".join(f"{k}={v}" for k, v in
+                         (t.last_scan_versions or {}).items()),
                 t.created_batch, _fmt_dt(t.created_at),
                 t.fixed_by, _fmt_dt(t.fixed_at),
                 t.verified_by, _fmt_dt(t.verified_at),

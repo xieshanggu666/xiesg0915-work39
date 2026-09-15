@@ -799,6 +799,49 @@ def _cmd_batch(args) -> int:
         coord_mode = getattr(args, "coord_mode", "auto")
         run_coord = {"auto": None, "off": False, "required": True}[coord_mode]
 
+        # ---- 局部复查范围（单体 / 专业 / 核查项）----
+        from . import collab as collab_mod
+        scan_paths = list(args.paths)
+        recheck_units = list(getattr(args, "recheck_unit", []) or [])
+        recheck_disciplines = list(getattr(args, "recheck_discipline", []) or [])
+        recheck_kinds = list(getattr(args, "recheck_kind", []) or [])
+        valid_disc = {"arch", "struct", "mep"}
+        bad_disc = [d for d in recheck_disciplines if d not in valid_disc]
+        if bad_disc:
+            print(f"配置错误：未知复查专业“{'、'.join(bad_disc)}”，"
+                  f"可选 arch/struct/mep", file=sys.stderr)
+            return 2
+        valid_kinds = set(collab_mod.AUDIT_KINDS) | set(collab_mod.KIND_ALIASES)
+        bad_kinds = [k for k in recheck_kinds if k not in valid_kinds]
+        if bad_kinds:
+            print(f"配置错误：未知复查核查项“{'、'.join(bad_kinds)}”，"
+                  f"可选：{'、'.join(sorted(valid_kinds))}", file=sys.stderr)
+            return 2
+        if recheck_units:
+            # 先展开输入路径，按 unique_unit_names 得到的单体名精确过滤
+            from .batch import discover_ifc_files, unique_unit_names
+            all_files = discover_ifc_files(args.paths)
+            name_of = unique_unit_names(all_files)
+            wanted = set(recheck_units)
+            available = set(name_of.values())
+            kept = [f for f in all_files if name_of.get(f) in wanted]
+            missing = sorted(wanted - available)
+            if not kept:
+                print(f"配置错误：复查单体 {'、'.join(sorted(wanted))} "
+                      f"在输入中没有匹配的 IFC 文件；可用单体："
+                      f"{'、'.join(sorted(available))}", file=sys.stderr)
+                return 2
+            if missing:
+                print(f"[warn] 复查单体 {'、'.join(missing)} 未在输入中找到，"
+                      "已忽略", file=sys.stderr)
+            scan_paths = kept
+        scan_scope = collab_mod.ScanScope.make(
+            units=recheck_units, disciplines=recheck_disciplines,
+            kinds=recheck_kinds)
+        if scan_scope.partial and not args.quiet:
+            print(f"[复查] 本次为局部复查：{scan_scope.describe()}；"
+                  "范围外 / 扫描失败的工单保留状态，不自动销项。")
+
         # 批量默认按项目/阶段自动选包；--no-rule-pack 显式关闭自动选择。
         # 显式 --rule-pack 与自动选包共用同一套冲突判定（含 --no-gate）。
         auto = getattr(args, "use_rule_pack", True) \
@@ -837,13 +880,13 @@ def _cmd_batch(args) -> int:
         )
         if mat is not None:
             batch = run_batch_with_rule_pack(
-                args.paths, mat,
+                scan_paths, mat,
                 project=args.project, label=args.label or "",
                 progress=progress if not args.quiet else None,
                 **common_kw)
         else:
             batch = run_batch_with_config(
-                args.paths,
+                scan_paths,
                 project=args.project,
                 label=args.label or "",
                 threshold_profile=args.profile,
@@ -894,7 +937,7 @@ def _cmd_batch(args) -> int:
                 and getattr(args, "collab_gate_profile", "default") == "default":
             args.collab_gate_profile = "none"
         collab_paths, _collab_blocked, collab_failed = _run_collab_for_batch(
-            batch, args, out_dir, history_dir)
+            batch, args, out_dir, history_dir, scope=scan_scope)
 
     # 快照留存（批次 JSON 导出后再留存，供后续批次趋势对比）
     snap = save_batch_snapshot(batch, history_dir)
@@ -1008,13 +1051,16 @@ def _export_coordination(batch, out_dir, quiet) -> dict[str, str]:
     return paths
 
 
-def _run_collab_for_batch(batch, args, out_dir, history_dir):
+def _run_collab_for_batch(batch, args, out_dir, history_dir, scope=None):
     """把批量核查结果纳入协同问题闭环台账，评估闭环门禁并导出闭环产物。
 
     返回 (导出路径字典, 闭环门禁是否阻断, 失败规则列表)。只纳管实际检出的
     审查/协同问题；**不**把门禁失败项再建成规则工单（否则会被门禁重复执法，
     同一批次出现循环阻断与重复结论）。规则校验问题可由调用方通过
     :func:`ifc_audit.collab.ingest_rule_violations` 显式纳管。
+
+    ``scope`` 为局部复查范围（单体 / 专业 / 核查项）；范围外与扫描失败的
+    工单保留状态，不自动销项。
     """
     from . import collab, collab_report
     from .collab_model import CollabLedger
@@ -1032,7 +1078,7 @@ def _run_collab_for_batch(batch, args, out_dir, history_dir):
             print(f"[闭环] {msg}", flush=True)
 
     collab.ingest_batch(
-        ledger, batch, sla_hours=sla_hours,
+        ledger, batch, sla_hours=sla_hours, scope=scope,
         progress=(progress if not getattr(args, "quiet", False) else None))
 
     gate_passed, gate_rules = collab.evaluate_collab_gate(
@@ -1080,9 +1126,31 @@ def _print_collab_summary(ledger, gate_passed, gate_rules) -> None:
     print("状态分布    : " + (st or "无"))
     print(f"超期 {s['overdue']} / 升级 {s['escalated']} / "
           f"未指派 {s['no_owner']}；名册成员 {len(ledger.users)} 人")
-    # 只列闭环流程治理类失败项；最终放行结论在汇总末尾统一给出（此处不下结论）
+    ls = s.get("last_scan")
+    if ls:
+        kind = "局部复查" if ls["scoped"] else "全量复查"
+        print(f"最近复查    : {kind}（批次 {ls['batch_id']}，{ls['at']}）"
+              f" 范围：{ls['scope']}")
+        print(f"  实际扫描单体 {len(ls['scanned_units'])} 个"
+              f"（{('、'.join(ls['scanned_units'])) or '无'}）；"
+              f"模型版本 {len(ls['model_versions'])} 份已留痕")
+        if ls["n_auto_verified"] or ls["n_auto_cleared"]:
+            print(f"  自动销项：复核通过 {ls['n_auto_verified']} / "
+                  f"已消除 {ls['n_auto_cleared']}（均为成功覆盖且未再检出）")
+        if ls["failed_files"]:
+            names = "、".join(f"{f['unit'] or f['file']}"
+                             for f in ls["failed_files"])
+            print(f"  ⚠ 扫描失败模型 {len(ls['failed_files'])} 个（{names}）；"
+                  f"相关 {ls['n_scan_failed']} 张工单保留状态")
+        if ls["n_out_of_scope"]:
+            print(f"  ⚠ 不在复查范围 {ls['n_out_of_scope']} 张，状态保留")
+        if not ls["failed_files"] and not ls["n_out_of_scope"]:
+            print("  覆盖完整：无范围外 / 失败保留工单")
+    # 只列闭环流程治理类失败项；告警项（局部复查未覆盖，不阻断）单独提示
     for r in gate_rules:
-        if not r["passed"]:
+        if r.get("advisory"):
+            print(f"  ⚠ [闭环·告警] {r['actual']}（{r['limit']}）")
+        elif not r["passed"]:
             print(f"  ✗ [闭环] {r['message']}")
 
 
@@ -1274,6 +1342,20 @@ def main(argv=None) -> int:
     p_batch.add_argument("--collab-sla", type=float, default=None,
                          metavar="小时",
                          help="闭环工单整改时限（小时），默认取闭环门禁预设值")
+    # 局部复查：按单体 / 专业 / 核查项圈定本次复查范围
+    p_batch.add_argument("--recheck-unit", action="append", default=[],
+                         metavar="单体名",
+                         help="局部复查：仅复查指定单体（可重复）；范围外工单"
+                              "保留状态不自动销项。不给=全部输入单体")
+    p_batch.add_argument("--recheck-discipline", action="append", default=[],
+                         metavar="专业",
+                         help="局部复查：仅复查指定专业 arch/struct/mep（可重复）")
+    p_batch.add_argument("--recheck-kind", action="append", default=[],
+                         metavar="核查项",
+                         help="局部复查：仅复查指定核查项（可重复）："
+                              "wall=墙体闭合 / duplicate=重复构件 / "
+                              "room=房间净面积 / opening=门窗规格，"
+                              "也可用具体 kind 如 wall_free_end")
     p_batch.set_defaults(use_rule_pack=True, func=_cmd_batch)
 
     # ---- 批次历史趋势 ----
