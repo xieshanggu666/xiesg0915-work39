@@ -186,7 +186,8 @@ class CoordElement:
     ifc_type: str
     name: str
     discipline: str
-    unit: str = ""                 # 所属单体（文件名）
+    unit: str = ""                 # 所属单体（批次内显示名）
+    unit_key: str = ""             # 跨批次稳定单体标识（文件名去后缀）
     file_path: str = ""
     storey: str = ""
     object_type: str = ""
@@ -225,6 +226,7 @@ class CoordElement:
             "name": self.name,
             "discipline": self.discipline,
             "unit": self.unit,
+            "unit_key": self.unit_key,
             "file_path": self.file_path,
             "storey": self.storey,
             "object_type": self.object_type,
@@ -412,6 +414,8 @@ class DisciplineFile:
     unit: str
     file_path: str
     discipline: str
+    # 跨批次稳定单体标识（文件名去后缀），与批次内显示名 unit 区分
+    unit_key: str = ""
     ok: bool = True
     error: str = ""
     n_elements: int = 0

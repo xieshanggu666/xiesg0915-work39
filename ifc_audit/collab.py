@@ -46,7 +46,8 @@ from .coordination_model import (
 )
 from .collab_model import (
     CollabTicket, ModelRef, RosterUser, Notification, CollabLedger,
-    ScanRun, make_ticket_fingerprint,
+    ScanRun, make_ticket_fingerprint, make_audit_fingerprint,
+    make_legacy_audit_fingerprint,
     SOURCE_AUDIT, SOURCE_COORD, SOURCE_RULE, SOURCE_MANUAL, SOURCES, SOURCE_CN,
     SEVERITIES,
     STATUS_CLOSED, STATUS_CN,
@@ -202,11 +203,14 @@ def model_file_version(path: str) -> str:
 
 @dataclass
 class _ScanIndices:
-    """一次扫描按 (单体, 专业) 汇总的成功 / 失败索引，供覆盖判定。"""
+    """一次扫描按 (稳定单体, 专业) 汇总的成功 / 失败索引，供覆盖判定。"""
 
     ok_pairs: set[tuple[str, str]] = field(default_factory=set)
     failed_pairs: set[tuple[str, str]] = field(default_factory=set)
+    ok_units: set[str] = field(default_factory=set)
     failed_units: set[str] = field(default_factory=set)
+    # 批次内显示名 -> 稳定单体标识（历史工单只有显示名时换算用）
+    name_to_key: dict[str, str] = field(default_factory=dict)
     pair_versions: dict[tuple[str, str], str] = field(default_factory=dict)
     pair_files: dict[tuple[str, str], str] = field(default_factory=dict)
     files_info: list[dict] = field(default_factory=list)
@@ -227,86 +231,119 @@ def _guess_discipline_from_name(name: str) -> str:
     return "arch"
 
 
+def _unit_key_of_unit(unit) -> str:
+    """从批次单体结果取稳定单体标识（缺失时由文件名推导）。"""
+    uk = getattr(unit, "unit_key", "") or ""
+    if uk:
+        return uk
+    fp = getattr(unit, "file_path", "") or ""
+    return os.path.splitext(os.path.basename(fp))[0] if fp else unit.name
+
+
+def _ticket_unit_keys(t: CollabTicket) -> list[str]:
+    """工单涉及的稳定单体标识集合（含历史显示名回落）。"""
+    keys: set[str] = set()
+    if getattr(t, "unit_key", ""):
+        keys.add(t.unit_key)
+    for r in t.refs:
+        uk = getattr(r, "unit_key", "") or ""
+        if uk:
+            keys.add(uk)
+    # 旧台账没有 unit_key 字段：退回显示名（与当时扫描索引的键一致）
+    if not keys:
+        if t.unit:
+            keys.add(t.unit)
+        for r in t.refs:
+            if r.unit:
+                keys.add(r.unit)
+    return sorted(keys)
+
+
 def _build_scan_indices(batch, coord, *, hash_files: bool) -> _ScanIndices:
-    """从批次结果构建实际扫描成功 / 失败索引（audit 单体 + coord 专业模型）。"""
+    """从批次结果构建实际扫描成功 / 失败索引（audit 单体 + coord 专业模型）。
+
+    配对主键统一为 **(稳定单体标识 unit_key, 专业)**；同时登记显示名到稳定
+    标识的映射，供历史工单（无 unit_key、只有消歧显示名）回落匹配。
+    """
     idx = _ScanIndices()
 
-    # 协同专业模型 -> (单体, 专业)；用于补全 audit 单体的实际专业归属
-    coord_disc_by_unit: dict[str, str] = {}
-    if coord is not None:
-        for f in getattr(coord, "files", []):
-            disc = getattr(f, "discipline", "") or ""
-            if getattr(f, "unit", ""):
-                coord_disc_by_unit.setdefault(f.unit, disc)
-            pair = (f.unit, disc)
-            if getattr(f, "ok", True):
-                idx.ok_pairs.add(pair)
-                if f.unit:
-                    idx.scanned_units.add(f.unit)
-                ver = ""
-                if hash_files and getattr(f, "file_path", ""):
-                    ver = model_file_version(f.file_path)
-                if ver:
-                    idx.pair_versions[pair] = ver
-                    idx.pair_files[pair] = f.file_path
-                    idx.files_info.append({
-                        "unit": f.unit, "discipline": disc,
-                        "file": f.file_path, "version": ver})
-            else:
-                idx.failed_pairs.add(pair)
-                if f.unit:
-                    idx.failed_units.add(f.unit)
-                idx.failed_files.append({
-                    "unit": f.unit, "discipline": disc,
-                    "file": getattr(f, "file_path", ""),
-                    "error": getattr(f, "error", "")})
-
-    for unit in batch.units:
-        guessed = coord_disc_by_unit.get(unit.name) \
-            or _guess_discipline_from_name(
-                f"{unit.name} {getattr(unit, 'file_path', '')}")
-        if getattr(unit, "model", None) is None:
-            # 单体扫描失败（无模型结果）：与其专业配对失败；
-            # 协同侧已记录过同一 (单体, 专业) 失败时去重
-            pair = (unit.name, guessed)
+    def _add_pair(uk, disc, display, fp, ok, error=""):
+        pair = (uk, disc or "")
+        if display:
+            idx.name_to_key[display] = uk
+        if ok:
+            idx.ok_pairs.add(pair)
+            idx.ok_units.add(uk)
+            if uk:
+                idx.scanned_units.add(uk)
+            ver = model_file_version(fp) if hash_files and fp else ""
+            if ver:
+                idx.pair_versions[pair] = ver
+                idx.pair_files[pair] = fp
+                idx.files_info.append({"unit": uk, "display": display,
+                                       "discipline": disc or "",
+                                       "file": fp, "version": ver})
+        else:
             idx.failed_pairs.add(pair)
-            idx.failed_units.add(unit.name)
+            if uk:
+                idx.failed_units.add(uk)
             idx.ok_pairs.discard(pair)
-            if not any(f["unit"] == unit.name and f["discipline"] == guessed
+            if not any(f["unit"] == uk and f["discipline"] == (disc or "")
                        for f in idx.failed_files):
                 idx.failed_files.append({
-                    "unit": unit.name, "discipline": guessed,
-                    "file": getattr(unit, "file_path", ""),
-                    "error": getattr(unit, "error", "模型核查失败")})
-            continue
-        idx.scanned_units.add(unit.name)
-        pair = (unit.name, guessed)
-        idx.ok_pairs.add(pair)
+                    "unit": uk, "display": display,
+                    "discipline": disc or "", "file": fp,
+                    "error": error or "模型核查失败"})
+
+    # 协同专业模型
+    if coord is not None:
+        for f in getattr(coord, "files", []):
+            uk = getattr(f, "unit_key", "") or os.path.splitext(
+                os.path.basename(getattr(f, "file_path", "")))[0]
+            _add_pair(uk, getattr(f, "discipline", ""),
+                      getattr(f, "unit", ""), getattr(f, "file_path", ""),
+                      getattr(f, "ok", True), getattr(f, "error", ""))
+
+    # 批量单体结果
+    for unit in batch.units:
+        uk = _unit_key_of_unit(unit)
         fp = getattr(unit, "file_path", "")
-        ver = model_file_version(fp) if hash_files and fp else ""
-        if ver:
-            idx.pair_versions[pair] = ver
-            idx.pair_files[pair] = fp
-            idx.files_info.append({"unit": unit.name, "discipline": guessed,
-                                   "file": fp, "version": ver})
+        # 专业优先取协同侧；否则按文件名推断
+        disc = next((d for (u2, d) in idx.ok_pairs | idx.failed_pairs
+                     if u2 == uk and d), "") or \
+            _guess_discipline_from_name(f"{unit.name} {fp}")
+        ok = getattr(unit, "model", None) is not None
+        _add_pair(uk, disc, unit.name, fp, ok,
+                  getattr(unit, "error", "模型核查失败"))
     return idx
 
 
-def _ticket_scan_pairs(t: CollabTicket) -> list[tuple[str, str]]:
-    """工单依赖的 (单体, 专业) 配对（覆盖判定用）。"""
+def _resolve_ticket_units(t: CollabTicket, idx: _ScanIndices) -> list[str]:
+    """工单稳定单体标识；旧工单只有显示名时用本批 name->key 映射换算。"""
+    keys = set(_ticket_unit_keys(t))
+    resolved: set[str] = set()
+    for k in keys:
+        resolved.add(idx.name_to_key.get(k, k))
+    return sorted(resolved)
+
+
+def _ticket_scan_pairs(t: CollabTicket, idx: Optional[_ScanIndices] = None
+                       ) -> list[tuple[str, str]]:
+    """工单依赖的 (稳定单体, 专业) 配对（覆盖判定用）。"""
     pairs: set[tuple[str, str]] = set()
     if t.source == SOURCE_AUDIT:
-        units = {t.unit} if t.unit else set()
-        units.update(r.unit for r in t.refs if r.unit)
+        units = set(_ticket_unit_keys(t))
+        if idx is not None:
+            units = set(_resolve_ticket_units(t, idx))
         disc = t.owner_discipline or "arch"
         pairs.update((u, disc) for u in units)
     else:
         for r in t.refs:
-            if r.unit:
-                pairs.add((r.unit, r.discipline
-                           or t.owner_discipline or ""))
-        if not pairs and t.unit:
-            pairs.add((t.unit, t.owner_discipline))
+            uk = getattr(r, "unit_key", "") or r.unit
+            if uk:
+                pairs.add((uk, r.discipline or t.owner_discipline or ""))
+        if not pairs and (t.unit_key or t.unit):
+            pairs.add((t.unit_key or t.unit, t.owner_discipline))
     return sorted(pairs)
 
 
@@ -322,18 +359,24 @@ def ticket_cover_result(t: CollabTicket, scope: ScanScope,
     if t.source not in (SOURCE_AUDIT, SOURCE_COORD):
         return COVER_OUT_OF_SCOPE
     if scope.units:
-        units = {t.unit} if t.unit else set()
-        units.update(r.unit for r in t.refs if r.unit)
-        if not (units & scope.units):
+        # 申请范围用显示名（CLI 传入）；同时用本批映射与稳定标识比较，
+        # 兼容“上一批带目录前缀、本批不带”等单体显示名漂移
+        units = set(_resolve_ticket_units(t, idx))
+        names = {t.unit} | {r.unit for r in t.refs if r.unit}
+        wanted = set(scope.units)
+        if not (units & wanted) and not (names & wanted):
             return COVER_OUT_OF_SCOPE
     if scope.disciplines and not scope.covers_disciplines(
             t.disciplines or [t.owner_discipline]):
         return COVER_OUT_OF_SCOPE
     if scope.kinds and not scope.covers_kind(t.kind):
         return COVER_OUT_OF_SCOPE
-    pairs = _ticket_scan_pairs(t)
+    pairs = _ticket_scan_pairs(t, idx)
+    pair_units = {p[0] for p in pairs}
+    if pair_units & idx.failed_units:
+        return COVER_SCAN_FAILED
     for p in pairs:
-        if p in idx.failed_pairs or p[0] in idx.failed_units:
+        if p in idx.failed_pairs:
             return COVER_SCAN_FAILED
     # 依赖的 (单体, 专业) 模型本次没有成功扫描 -> 未实际覆盖（范围外）
     if pairs and not all(p in idx.ok_pairs for p in pairs):
@@ -616,15 +659,21 @@ def _refs_from_coord_elements(elements: list[dict],
                               file_by_unit: Optional[dict[str, str]] = None
                               ) -> list[ModelRef]:
     file_by_unit = file_by_unit or {}
-    return [ModelRef(
-        global_id=e.get("global_id", ""),
-        ifc_type=e.get("ifc_type", ""),
-        name=e.get("name", ""),
-        discipline=e.get("discipline", ""),
-        unit=e.get("unit", ""),
-        storey=e.get("storey", ""),
-        file_path=e.get("file_path", "")
-        or file_by_unit.get(e.get("unit", ""), "")) for e in elements]
+    refs = []
+    for e in elements:
+        fp = e.get("file_path", "") or file_by_unit.get(e.get("unit", ""), "")
+        uk = e.get("unit_key", "") or os.path.splitext(
+            os.path.basename(fp))[0] if fp else e.get("unit", "")
+        refs.append(ModelRef(
+            global_id=e.get("global_id", ""),
+            ifc_type=e.get("ifc_type", ""),
+            name=e.get("name", ""),
+            discipline=e.get("discipline", ""),
+            unit=e.get("unit", ""),
+            unit_key=uk,
+            storey=e.get("storey", ""),
+            file_path=fp))
+    return refs
 
 
 def _coord_owner(kind: str, owners: dict[str, str], fallback_lead: bool
@@ -677,6 +726,10 @@ def ingest_coordination(ledger: CollabLedger, coord_result,
         key = f"fp:{ci.fingerprint}"
         present.add(key)
         refs = _refs_from_coord_elements(ci.elements, file_by_unit)
+        ref_units = sorted({r.unit for r in refs if r.unit})
+        ref_keys = sorted({r.unit_key for r in refs if r.unit_key})
+        main_unit = ref_units[0] if len(ref_units) == 1 else ""
+        main_key = ref_keys[0] if len(ref_keys) == 1 else ""
         old = ledger.get(key)
         if old is None:
             t = CollabTicket(
@@ -690,6 +743,7 @@ def ingest_coordination(ledger: CollabLedger, coord_result,
                 disciplines=list(ci.disciplines),
                 location=tuple(ci.location),
                 storey=ci.storey,
+                unit=main_unit, unit_key=main_key,
                 measure=ci.measure, measure_label=ci.measure_label,
                 owner_discipline=ci.owner_discipline,
                 owner=ci.owner or owners.get(ci.owner_discipline, ""),
@@ -749,7 +803,7 @@ def _stamp_scan(t: CollabTicket, idx: Optional[_ScanIndices], batch_id: str,
     if versions is None:
         versions = {}
     if idx is not None:
-        for unit, disc in _ticket_scan_pairs(t):
+        for unit, disc in _ticket_scan_pairs(t, idx):
             ver = idx.pair_versions.get((unit, disc))
             if ver:
                 versions[f"{unit}|{idx.pair_files.get((unit, disc), '')}"] = ver
@@ -789,9 +843,104 @@ def _refresh_from_scan(ledger: CollabLedger, t: CollabTicket, ci, refs, now,
     t.disciplines = list(ci.disciplines)
     t.location = tuple(ci.location)
     t.storey = ci.storey
+    ref_units = sorted({r.unit for r in refs if r.unit})
+    ref_keys = sorted({r.unit_key for r in refs if r.unit_key})
+    if len(ref_units) == 1:
+        t.unit = ref_units[0]
+    if len(ref_keys) == 1:
+        t.unit_key = ref_keys[0]
     t.measure, t.measure_label = ci.measure, ci.measure_label
     t.updated_at = now
     return reopened
+
+
+def _legacy_exact_audit_key(iss, unit_name: str) -> str:
+    """旧口径精确指纹（issue_id + 消歧显示名），带 ``fp:`` 前缀。"""
+    return "fp:" + make_legacy_audit_fingerprint(
+        iss.kind, iss.global_ids, unit_name, iss.issue_id, iss.storey)
+
+
+def _weak_audit_key(kind: str, gids: list[str], unit_key: str,
+                    storey: str, location, measure: float = 0.0) -> tuple:
+    """物理弱键：kind + 稳定单体 + 楼层 + 构件集 + 位置网格 + 量化指标。
+
+    用于旧台账中“指纹带漂移 issue_id”的工单兼容匹配；不含扫描序号，
+    只依赖模型物理要素。同一构件同楼层的多个问题靠位置网格与量化指标区分。
+    """
+    from .collab_model import quantize_loc
+    gid_part = ",".join(sorted(g for g in (gids or []) if g))
+    loc = tuple(quantize_loc(v) for v in tuple(location or ())[:2])
+    meas = int(round(float(measure or 0.0) * 1000.0))
+    return (kind, unit_key, storey or "", gid_part, loc, meas)
+
+
+def _ticket_weak_audit_key(t: CollabTicket) -> tuple:
+    uk = t.unit_key or os.path.splitext(
+        os.path.basename(t.refs[0].file_path if t.refs else ""))[0]
+    gids = [r.global_id for r in t.refs if r.global_id]
+    return _weak_audit_key(t.kind, gids, uk, t.storey, t.location, t.measure)
+
+
+def _find_legacy_audit_ticket(ledger: CollabLedger, iss,
+                              unit_name: str, unit_key: str
+                              ) -> tuple[Optional[str], Optional[CollabTicket]]:
+    """在历史台账中回查与本次 audit 问题对应的旧工单。
+
+    匹配优先级：
+
+    1. 旧口径精确指纹（``issue_id|storey`` + 旧显示名 / 稳定单体名）；
+    2. 物理弱键（kind+单体+楼层+构件集+位置网格），仅接受**唯一**候选，
+       避免把同一单体上多个不同问题误并。
+
+    返回 (旧主键, 工单)；找不到时 (None, None)。
+    """
+    gids = list(iss.global_ids or [])
+    # 1) 旧精确指纹：同时尝试历史显示名与稳定单体名两种 unit 取值
+    for uname in dict.fromkeys([unit_name, unit_key, ""]):
+        old_fp = _legacy_exact_audit_key(iss, uname)
+        hit = ledger.get(old_fp)
+        if hit is not None and hit.source == SOURCE_AUDIT:
+            return old_fp, hit
+        k2, hit2 = ledger.find_by_fp_or_alias(old_fp)
+        if hit2 is not None and hit2.source == SOURCE_AUDIT:
+            return k2, hit2
+
+    # 2) 物理弱键：在 audit 活动 / 已闭环工单中找唯一匹配
+    target = _weak_audit_key(iss.kind, gids, unit_key, iss.storey,
+                             iss.location, iss.measure)
+    candidates = [
+        (k, t) for k, t in ledger.tickets.items()
+        if t.source == SOURCE_AUDIT and t.kind == iss.kind
+        and _weak_key_compatible(t, target)]
+    if len(candidates) == 1:
+        return candidates[0]
+    return None, None
+
+
+def _weak_key_compatible(t: CollabTicket, target: tuple) -> bool:
+    """工单弱键与目标是否一致（兼容旧工单缺失的稳定单体 / 楼层字段）。"""
+    kind, unit_key, storey, gid_part, loc, meas = target
+    tkind, tuk, tstorey, tgid, tloc, tmeas = _ticket_weak_audit_key(t)
+    if tkind != kind:
+        return False
+    # 旧工单无稳定单体标识时不比对单体（由构件 GlobalId + 位置锁定）
+    if tuk and unit_key and tuk != unit_key:
+        return False
+    if gid_part != tgid:
+        return False
+    # 楼层：旧工单可能未填顶层 storey，退而取构件引用楼层
+    if tstorey != storey:
+        ref_storeys = {r.storey for r in t.refs if r.storey}
+        if tstorey or (storey and storey not in ref_storeys):
+            return False
+    # 至少有构件或位置强一致要素
+    if not gid_part and loc != tloc:
+        return False
+    if gid_part and loc and tloc != loc:
+        return False
+    if gid_part and tloc == loc and tmeas != meas:
+        return False
+    return True
 
 
 def ingest_batch(ledger: CollabLedger, batch,
@@ -848,6 +997,9 @@ def ingest_batch(ledger: CollabLedger, batch,
             # 扫描失败的单体在 _sweep_with_coverage 中按 scan_failed 保留
             continue
         unit_name = unit.name
+        unit_key = getattr(unit, "unit_key", "") or \
+            os.path.splitext(os.path.basename(
+                getattr(unit, "file_path", "")))[0]
         file_path = getattr(unit, "file_path", "")
         for iss in model.issues:
             if iss.severity == "info" and not include_infos:
@@ -855,24 +1007,41 @@ def ingest_batch(ledger: CollabLedger, batch,
             if not scope.covers_kind(iss.kind) or not audit_in_disc:
                 continue
             disc = AUDIT_KIND_OWNER.get(iss.kind, "arch")
-            extra = f"{iss.issue_id}|{iss.storey}"
-            key = "fp:" + make_ticket_fingerprint(
-                SOURCE_AUDIT, iss.kind, iss.global_ids,
-                unit=unit_name, extra=extra)
-            present.add(key)
+            # 稳定指纹：不含每批重排的 issue_id，单体用跨批次稳定标识
+            key = "fp:" + make_audit_fingerprint(
+                iss.kind, iss.global_ids, unit_key,
+                storey=iss.storey, location=iss.location,
+                measure=iss.measure)
             refs = [ModelRef(global_id=gid, discipline=disc, unit=unit_name,
-                             storey=iss.storey, file_path=file_path)
+                             unit_key=unit_key, storey=iss.storey,
+                             file_path=file_path)
                     for gid in iss.global_ids]
             loc3 = (float(iss.location[0]), float(iss.location[1]), 0.0) \
                 if iss.location else (0.0, 0.0, 0.0)
-            old = ledger.get(key)
+            # 兼容历史台账：新指纹未命中时，用旧口径（issue_id + 显示名）与
+            # 物理弱键（kind + 单体 + 楼层 + 构件）回查旧工单并迁移
+            old_key, old = ledger.find_by_fp_or_alias(key)
+            migrated = False
+            if old is None:
+                old_key, old = _find_legacy_audit_ticket(
+                    ledger, iss, unit_name, unit_key)
+            if old is not None and old_key is not None and old_key != key:
+                ledger.rekey(old_key, key)
+                if old_key not in old.fingerprint_aliases:
+                    old.fingerprint_aliases.append(old_key)
+                migrated = True
+                _record(old, "fp_migrate", old.status, old.status, SYSTEM_ACTOR,
+                        "单体稳定标识 / 指纹口径升级，历史工单指纹迁移，"
+                        "状态与整改记录保留", batch_id, at=now,
+                        extra={"from": old_key, "to": key})
+            present.add(key)
             if old is None:
                 t = CollabTicket(
                     ticket_id=f"COLL-{seq:04d}",
                     fingerprint=key, source=SOURCE_AUDIT, kind=iss.kind,
                     severity=iss.severity, title=iss.title, detail=iss.detail,
                     refs=refs, disciplines=[disc], location=loc3,
-                    storey=iss.storey, unit=unit_name,
+                    storey=iss.storey, unit=unit_name, unit_key=unit_key,
                     measure=iss.measure,
                     owner_discipline=disc,
                     owner=owners.get(disc, ""),
@@ -899,6 +1068,9 @@ def ingest_batch(ledger: CollabLedger, batch,
                 old.measure = iss.measure
                 old.refs = refs
                 old.location = loc3
+                old.unit = unit_name
+                old.unit_key = unit_key
+                old.source_ref = iss.issue_id
                 old.updated_at = now
                 _stamp_scan(old, idx, batch_id, now, result=COVER_PRESENT)
                 if old.closed:
@@ -938,33 +1110,39 @@ def ingest_batch(ledger: CollabLedger, batch,
 def _indices_from_coord(coord, *, hash_files: bool = True) -> _ScanIndices:
     idx = _ScanIndices()
     for f in getattr(coord, "files", []):
-        unit = getattr(f, "unit", "")
+        display = getattr(f, "unit", "")
+        fp = getattr(f, "file_path", "")
+        unit = getattr(f, "unit_key", "") or \
+            os.path.splitext(os.path.basename(fp))[0]
         disc = getattr(f, "discipline", "") or ""
         pair = (unit, disc)
-        fp = getattr(f, "file_path", "")
+        if display:
+            idx.name_to_key[display] = unit
         if getattr(f, "ok", True):
             idx.ok_pairs.add(pair)
+            idx.ok_units.add(unit)
             if unit:
                 idx.scanned_units.add(unit)
             ver = model_file_version(fp) if hash_files and fp else ""
             if ver:
                 idx.pair_versions[pair] = ver
                 idx.pair_files[pair] = fp
-                idx.files_info.append({"unit": unit, "discipline": disc,
+                idx.files_info.append({"unit": unit, "display": display,
+                                       "discipline": disc,
                                        "file": fp, "version": ver})
         else:
             idx.failed_pairs.add(pair)
             if unit:
                 idx.failed_units.add(unit)
-            idx.failed_files.append({"unit": unit, "discipline": disc,
-                                     "file": fp,
+            idx.failed_files.append({"unit": unit, "display": display,
+                                     "discipline": disc, "file": fp,
                                      "error": getattr(f, "error", "")})
     return idx
 
 
 def _ticket_version_map(t: CollabTicket, idx: _ScanIndices) -> dict[str, str]:
     ver_map: dict[str, str] = {}
-    for unit, disc in _ticket_scan_pairs(t):
+    for unit, disc in _ticket_scan_pairs(t, idx):
         ver = idx.pair_versions.get((unit, disc))
         if ver:
             ver_map[f"{unit}|{idx.pair_files.get((unit, disc), '')}"] = ver
@@ -991,6 +1169,7 @@ def _sweep_with_coverage(ledger: CollabLedger, present: set[str],
             continue
         if not t.active:
             continue
+        # 本批仍检出：新指纹命中，或迁移前的旧指纹别名命中
         if key in present:
             continue
         result = ticket_cover_result(t, scope, idx)
@@ -1009,11 +1188,12 @@ def _sweep_with_coverage(ledger: CollabLedger, present: set[str],
             already = any(h.get("action") == "scan_failed"
                           and h.get("batch_id") == batch_id for h in t.history)
             if not already:
-                pair_units = {u for u, _ in _ticket_scan_pairs(t)}
+                pairs = _ticket_scan_pairs(t, idx)
+                pair_units = {u for u, _ in pairs}
                 failed = "、".join(
-                    f"{f['unit'] or f['file']}（{f['error'] or '扫描失败'}）"
+                    f"{f.get('display') or f['unit']}（{f['error'] or '扫描失败'}）"
                     for f in idx.failed_files
-                    if (f["unit"], f["discipline"]) in _ticket_scan_pairs(t)
+                    if (f["unit"], f["discipline"]) in pairs
                     or f["unit"] in pair_units)
                 _record(t, "scan_failed", t.status, t.status, SYSTEM_ACTOR,
                         "范围内模型扫描失败，不予自动销项，工单状态保留"
@@ -1150,10 +1330,13 @@ def ingest_rule_violations(ledger: CollabLedger, violations: list[dict],
         kind = v.get("kind", "rule_violation")
         disc = v.get("discipline", "arch")
         gids = v.get("global_ids", [])
+        unit_name = v.get("unit", "")
+        unit_key = v.get("unit_key", "") or unit_name
         key = "fp:" + make_ticket_fingerprint(
             SOURCE_RULE, kind, gids,
-            unit=v.get("unit", ""), extra=v.get("title", ""))
-        refs = [ModelRef(global_id=g, discipline=disc, unit=v.get("unit", ""),
+            unit=unit_key, extra=v.get("title", ""))
+        refs = [ModelRef(global_id=g, discipline=disc, unit=unit_name,
+                         unit_key=unit_key,
                          storey=v.get("storey", "")) for g in gids]
         old = ledger.get(key)
         if old is not None:
@@ -1167,7 +1350,7 @@ def ingest_rule_violations(ledger: CollabLedger, violations: list[dict],
             severity=v.get("severity", "warning"),
             title=v.get("title", "规则校验问题"),
             detail=v.get("detail", ""), refs=refs, disciplines=[disc],
-            storey=v.get("storey", ""), unit=v.get("unit", ""),
+            storey=v.get("storey", ""), unit=unit_name, unit_key=unit_key,
             measure=float(v.get("measure", 0.0)),
             measure_label=v.get("measure_label", ""),
             owner_discipline=disc, owner=owners.get(disc, ""),
@@ -1225,6 +1408,7 @@ def open_manual_ticket(ledger: CollabLedger, *, title: str, detail: str,
         severity=severity, title=title, detail=detail,
         refs=refs, disciplines=sorted({r.discipline for r in refs if r.discipline}),
         storey=storey, unit=unit,
+        unit_key=(unit or next((r.unit_key for r in refs if r.unit_key), "")),
         owner_discipline=owner_discipline,
         owner=owner or _default_owner(ledger, owner_discipline),
         status=STATUS_OPEN, created_batch=batch_id,
@@ -1331,7 +1515,8 @@ def writeback_fix(ledger: CollabLedger, ticket_id: str, actor: str,
     t.writeback_at = now
     if resolution_gids:
         t.resolution_refs = [ModelRef(global_id=g, discipline=t.owner_discipline,
-                                      unit=t.unit) for g in resolution_gids]
+                                      unit=t.unit, unit_key=t.unit_key)
+                             for g in resolution_gids]
     _record(t, "writeback", t.status, t.status, actor,
             f"整改回写：{resolution}", batch_id,
             extra={"resolution_refs": [g for g in (resolution_gids or [])]},
@@ -1763,17 +1948,21 @@ def default_ledger_path(history_dir: str, project: str) -> str:
 
 def gate_violations_from_batch(batch) -> list[dict]:
     """从批次门禁判定结果提取规则校验 / 门禁阻断问题（供 ingest 用）。"""
+    # 门禁 scope 用显示名；建立显示名 -> 稳定单体标识映射
+    name_to_key = {u.name: (u.unit_key or u.name) for u in batch.units}
     out: list[dict] = []
     for r in getattr(batch, "gate_results", []):
         if r.passed:
             continue
+        unit_name = r.scope if r.level == "unit" else ""
         out.append({
             "kind": f"gate_{r.level}_{r.key}",
             "title": f"[{r.level}] {r.rule} 超限",
             "detail": r.message,
             "severity": "error",
             "discipline": "arch",
-            "unit": r.scope if r.level == "unit" else "",
+            "unit": unit_name,
+            "unit_key": name_to_key.get(unit_name, unit_name),
             "measure": 0.0,
         })
     return out

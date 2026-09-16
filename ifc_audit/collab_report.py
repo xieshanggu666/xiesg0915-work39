@@ -285,7 +285,8 @@ def export_tickets_csv(ledger: CollabLedger, out_path: str) -> str:
     with open(out_path, "w", encoding="utf-8-sig", newline="") as f:
         w = csv.writer(f)
         w.writerow(["工单编号", "来源", "状态", "时限状态", "严重程度",
-                    "问题类型", "标题", "责任专业", "责任人", "单体", "楼层",
+                    "问题类型", "标题", "责任专业", "责任人", "单体", "单体标识",
+                    "楼层",
                     "x", "y", "z", "涉及构件GlobalId", "涉及文件",
                     "整改时限h", "整改截止", "剩余或超期h", "升级级别",
                     "整改说明", "关闭原因",
@@ -295,12 +296,14 @@ def export_tickets_csv(ledger: CollabLedger, out_path: str) -> str:
                     "来源单号", "详细说明"])
         for t in _ordered_tickets(ledger):
             rem = t.sla_remaining_hours()
+            unit_keys = "|".join(sorted({
+                (r.unit_key or "") for r in t.refs if r.unit_key}))
             w.writerow([
                 t.ticket_id, SOURCE_CN.get(t.source, t.source),
                 STATUS_CN.get(t.status, t.status), t.sla_status_cn(),
                 t.severity, t.kind, t.title,
                 DISC_CN.get(t.owner_discipline, t.owner_discipline),
-                t.owner, t.unit, t.storey,
+                t.owner, t.unit, t.unit_key or unit_keys, t.storey,
                 round(t.location[0], 3), round(t.location[1], 3),
                 round(t.location[2], 3),
                 ";".join(r.global_id for r in t.refs if r.global_id),

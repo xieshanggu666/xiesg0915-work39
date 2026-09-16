@@ -334,7 +334,9 @@ def load_discipline_file(file_path: str, unit: str,
     """
     ifc_file = ifcopenshell.open(file_path)
     scale = project_length_scale(ifc_file)
+    unit_key = os.path.splitext(os.path.basename(file_path))[0]
     df = DisciplineFile(unit=unit, file_path=file_path,
+                        unit_key=unit_key,
                         discipline=discipline or "")
 
     settings = ifc_geom.settings()
@@ -405,6 +407,7 @@ def load_discipline_file(file_path: str, unit: str,
             name=elem.Name or "",
             discipline=disc or "",
             unit=unit,
+            unit_key=unit_key,
             file_path=file_path,
             storey=_storey_of(elem),
             object_type=getattr(elem, "ObjectType", "") or "",
@@ -495,6 +498,7 @@ def _element_ref(e: CoordElement) -> dict:
         "name": e.name,
         "discipline": e.discipline or e.host_discipline,
         "unit": e.unit,
+        "unit_key": e.unit_key,
         "storey": e.storey,
     }
 

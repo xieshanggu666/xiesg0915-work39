@@ -56,6 +56,8 @@ __all__ = [
     "EVENT_CN",
     "CollabTicket", "ModelRef", "RosterUser", "Notification",
     "ScanRun", "CollabLedger", "make_ticket_fingerprint",
+    "make_audit_fingerprint", "make_legacy_audit_fingerprint",
+    "quantize_loc", "AUDIT_LOC_GRID_M",
 ]
 
 # ------------------------------------------------------------- 问题来源 ----
@@ -203,7 +205,8 @@ class ModelRef:
     ifc_type: str = ""
     name: str = ""
     discipline: str = ""        # arch / struct / mep
-    unit: str = ""              # 单体名
+    unit: str = ""              # 单体名（批次内显示名，可能带目录消歧）
+    unit_key: str = ""          # 跨批次稳定单体标识（文件名去后缀）
     file_path: str = ""
     storey: str = ""
 
@@ -241,7 +244,8 @@ class CollabTicket:
     disciplines: list[str] = field(default_factory=list)
     location: tuple[float, float, float] = (0.0, 0.0, 0.0)
     storey: str = ""
-    unit: str = ""                  # 主单体（按问题归属，跨单体可空）
+    unit: str = ""                  # 主单体显示名（按问题归属，跨单体可空）
+    unit_key: str = ""              # 主单体跨批次稳定标识（文件名去后缀）
 
     measure: float = 0.0
     measure_label: str = ""
@@ -280,6 +284,10 @@ class CollabTicket:
 
     # 与来源系统的关联（如协同 COORD-0001 / 单体问题 GAP-003）
     source_ref: str = ""
+
+    # 该工单历史上用过的指纹（单体身份 / 序号口径迁移时用于兼容匹配）。
+    # 重新纳管命中旧指纹时，工单合并迁移到新指纹并把旧指纹记入此集合。
+    fingerprint_aliases: list[str] = field(default_factory=list)
 
     # 重新核查时本批是否仍检出（瞬态，不持久化为 True）
     present_in_scan: bool = False
@@ -386,6 +394,56 @@ def make_ticket_fingerprint(source: str, kind: str,
         ref_part = ",".join(sorted(ids))
     payload = "|".join([source, kind, unit, ref_part, extra])
     return hashlib.sha1(payload.encode("utf-8")).hexdigest()[:14]
+
+
+# 位置量化网格（米）：用于把同一构件 / 同一位置上按扫描顺序变化的多条问题
+# （GAP/END/ENC 编号每次扫描重排）稳定区分开。50mm 网格足以区分相邻缺口，
+# 又能吸收坐标微小抖动。
+AUDIT_LOC_GRID_M = 0.05
+
+
+def quantize_loc(value, grid: float = AUDIT_LOC_GRID_M) -> int:
+    """把米制坐标量化到网格（四舍五入到最近网格编号）。"""
+    try:
+        return int(round(float(value) / grid))
+    except (TypeError, ValueError):
+        return 0
+
+
+def make_audit_fingerprint(kind: str, global_ids: list,
+                           unit_key: str, storey: str = "",
+                           location=(), measure: float = 0.0) -> str:
+    """批量审查（audit）问题的跨批次稳定指纹（不含会漂移的扫描序号）。
+
+    旧实现把每批重新编号的 ``issue_id``（GAP-001…）放进指纹，批次范围变化 /
+    前置问题修复后后续问题重新编号，指纹就对不上；这里改用物理稳定要素：
+
+    ``audit|kind|稳定单体|楼层|排序GlobalId|位置网格|量化指标``。
+
+    同一构件在同一位置同一量化指标的问题，无论本批排第几号都是同一指纹。
+    """
+    ids = ",".join(sorted(g for g in (global_ids or []) if g))
+    loc = ""
+    if location:
+        loc = ",".join(str(quantize_loc(v)) for v in
+                       tuple(location)[:3] if v is not None)
+    # measure 按 1mm（长度）/ 1mm³ 量纲量化，避免浮点尾差导致漂移
+    meas = f"{round(float(measure or 0.0) * 1000.0):d}"
+    payload = "|".join(["audit", kind, unit_key or "", storey or "",
+                        ids, loc, meas])
+    return hashlib.sha1(payload.encode("utf-8")).hexdigest()[:14]
+
+
+def make_legacy_audit_fingerprint(kind: str, global_ids: list,
+                                  unit_name: str, issue_id: str,
+                                  storey: str = "") -> str:
+    """旧版 audit 指纹（含每批重排的 issue_id 与消歧显示名）。
+
+    仅用于历史台账向后兼容匹配，新纳管一律用 :func:`make_audit_fingerprint`。
+    """
+    return make_ticket_fingerprint(
+        SOURCE_AUDIT, kind, global_ids or [],
+        unit=unit_name or "", extra=f"{issue_id}|{storey or ''}")
 
 
 # ------------------------------------------------------------- 人员名册 ----
@@ -515,11 +573,42 @@ class CollabLedger:
     def get(self, fingerprint: str) -> Optional[CollabTicket]:
         return self.tickets.get(fingerprint)
 
+    def find_by_fp_or_alias(self, fingerprint: str
+                            ) -> tuple[Optional[str], Optional[CollabTicket]]:
+        """按当前指纹或历史别名（含 ``fp:`` 前缀）查工单。
+
+        Returns:
+            (台账主键, 工单)；都没有时返回 (None, None)。
+        """
+        if fingerprint in self.tickets:
+            return fingerprint, self.tickets[fingerprint]
+        for key, t in self.tickets.items():
+            if fingerprint == key or fingerprint in t.fingerprint_aliases:
+                return key, t
+        return None, None
+
+    def rekey(self, old_key: str, new_key: str) -> Optional[CollabTicket]:
+        """把工单从旧指纹主键迁移到新指纹（保留同一工单与全部整改记录）。"""
+        t = self.tickets.get(old_key)
+        if t is None or old_key == new_key:
+            return t
+        if new_key in self.tickets:
+            # 目标已存在（罕见的新旧口径撞键）：不覆盖，保留原主键
+            return self.tickets[new_key]
+        t = self.tickets.pop(old_key)
+        if old_key not in t.fingerprint_aliases:
+            t.fingerprint_aliases.append(old_key)
+        t.fingerprint = new_key
+        self.tickets[new_key] = t
+        return t
+
     def find(self, ticket_id_or_fp: str) -> CollabTicket:
         if ticket_id_or_fp in self.tickets:
             return self.tickets[ticket_id_or_fp]
         for t in self.tickets.values():
             if t.ticket_id == ticket_id_or_fp:
+                return t
+            if ticket_id_or_fp in t.fingerprint_aliases:
                 return t
         raise KeyError(ticket_id_or_fp)
 

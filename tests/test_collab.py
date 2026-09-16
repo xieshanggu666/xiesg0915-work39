@@ -491,6 +491,149 @@ def run() -> int:
         v2 = model_file_version(f1)
         check(v1 != v2, "模型文件内容变化 -> 版本指纹变化")
 
+    # ---------------- 单体身份 / 工单指纹跨批次稳定性（防漂移回归）----
+    def _issue2(kind, gid, iid, loc=(0.0, 0.0), storey="1F", measure=0.0):
+        return SimpleNamespace(kind=kind, severity="warning",
+                               title=f"{kind}-{gid}", detail="",
+                               global_ids=[gid], storey=storey,
+                               location=loc, measure=measure, issue_id=iid)
+
+    def _unit2(name, issues, key=None, path=None, ok=True):
+        return SimpleNamespace(
+            name=name, unit_key=key or name,
+            file_path=path or f"/proj/{key or name}.ifc",
+            model=SimpleNamespace(issues=issues) if ok else None,
+            ok=ok, error="" if ok else "坏")
+
+    # 11) issue_id 每批重排不改变工单身份
+    ledk = _ledger()
+    ingest_batch(ledk, _batch([_unit2("楼A", [
+        _issue2("room_enclosure_gap", "R1", "GAP-001", (1.0, 2.0), measure=0.30),
+        _issue2("room_enclosure_gap", "R1", "GAP-002", (5.0, 6.0), measure=0.45),
+    ])], "K1"), sla_hours=0)
+    check(len(ledk.tickets) == 2, "同构件不同位置/指标的两个问题建两张工单")
+    t_first = next(t for t in ledk.tickets.values()
+                   if round(t.location[0], 1) == 1.0)
+    fix_ticket(ledk, t_first.ticket_id, "王设", "已补墙")
+    # 第二个批次：第一个缺口修复，残留问题的 issue_id 由 GAP-002 重排成 GAP-001
+    ingest_batch(ledk, _batch([_unit2("楼A", [
+        _issue2("room_enclosure_gap", "R1", "GAP-001", (5.0, 6.0), measure=0.45),
+    ])], "K2"), sla_hours=0)
+    check(len(ledk.tickets) == 2,
+          "issue_id 序号重排不产生重复工单（指纹不含扫描序号）")
+    t_first2 = ledk.find(t_first.ticket_id)
+    t_second = next(t for t in ledk.tickets.values()
+                    if round(t.location[0], 1) == 5.0)
+    check(t_first2.status == STATUS_VERIFIED
+          and t_first2.fixed_note == "已补墙",
+          "已报整改且成功覆盖消失 -> 自动复核，整改记录保留")
+    check(t_second.status == STATUS_OPEN,
+          "残留问题即便 issue_id 重排仍是原工单（保持待整改）")
+
+    # 12) 单体消歧显示名漂移（跨目录同名文件）不改变身份
+    ledn = _ledger()
+    ingest_batch(ledn, _batch([
+        _unit2("A区-楼A", [_issue2("wall_free_end", "N1", "END-001")],
+               key="楼A", path="/p/A区/楼A.ifc"),
+        _unit2("B区-楼A", [_issue2("wall_free_end", "N2", "END-001")],
+               key="楼A2", path="/p/B区/楼A.ifc"),
+    ], "N1"), sla_hours=0)
+    n_before = len(ledn.tickets)
+    # 第二批次只扫 A 区文件 -> 不再有同名冲突，显示名退化为“楼A”
+    ingest_batch(ledn, _batch([
+        _unit2("楼A", [_issue2("wall_free_end", "N1", "END-001")],
+               key="楼A", path="/p/A区/楼A.ifc"),
+    ], "N2"), sla_hours=0, scope=ScanScope.make(units=["楼A"]))
+    check(len(ledn.tickets) == n_before,
+          "单体显示名（消歧前缀）变化不重复建单")
+    tn = next(t for t in ledn.tickets.values()
+              if any(r.global_id == "N1" for r in t.refs))
+    check(tn.unit_key == "楼A", "工单稳定单体标识 unit_key 正确")
+
+    # 13) 批次组成变化（少扫单体）不误销、重纳入后正常销项
+    ledc = _ledger()
+    ingest_batch(ledc, _batch([
+        _unit2("1号楼", [_issue2("wall_end_gap", "C1", "GAP-001", (1, 1))]),
+        _unit2("2号楼", [_issue2("wall_end_gap", "C2", "GAP-001", (2, 2))]),
+        _unit2("3号楼", [_issue2("wall_end_gap", "C3", "GAP-001", (3, 3))]),
+    ], "C1"), sla_hours=0)
+    n_c = len(ledc.tickets)
+    # 只复查 1/2 号楼；1 号楼已整改，2 号楼问题 issue_id 变成 GAP-009
+    ingest_batch(ledc, _batch([
+        _unit2("1号楼", []),
+        _unit2("2号楼", [_issue2("wall_end_gap", "C2", "GAP-009", (2, 2))]),
+    ], "C2"), sla_hours=0,
+        scope=ScanScope.make(units=["1号楼", "2号楼"]))
+    by_gid = {r.global_id: t for t in ledc.tickets.values()
+              for r in t.refs}
+    check(len(ledc.tickets) == n_c, "批次少扫单体不增 / 不减工单")
+    check(by_gid["C1"].status == STATUS_CLEARED, "复查范围内消失 -> 已消除")
+    check(by_gid["C2"].status == STATUS_OPEN
+          and by_gid["C2"].last_cover_result == "present",
+          "issue_id 重排但物理要素不变 -> 识别为同一仍检出问题")
+    check(by_gid["C3"].status == STATUS_OPEN
+          and by_gid["C3"].last_cover_result == "out_of_scope",
+          "未复查单体工单保留（不误销）")
+    # 3 号楼重新纳入且已整改
+    ingest_batch(ledc, _batch([
+        _unit2("1号楼", []), _unit2("2号楼", []), _unit2("3号楼", []),
+    ], "C3"), sla_hours=0)
+    check(by_gid["C3"].status == STATUS_CLEARED and len(ledc.tickets) == n_c,
+          "缺扫单体重新纳入成功覆盖后正常销项，不重复建单")
+
+    # 14) 历史台账（旧指纹=issue_id+消歧显示名）自动迁移且保留整改记录
+    import json as _json
+    from ifc_audit.collab_model import make_legacy_audit_fingerprint
+    legacy_fp = "fp:" + make_legacy_audit_fingerprint(
+        "wall_free_end", ["OLDG"], unit_name="A区-楼A",
+        issue_id="END-003", storey="2F")
+    legacy_ticket = {
+        "ticket_id": "COLL-0001", "fingerprint": legacy_fp,
+        "source": "audit", "kind": "wall_free_end", "severity": "warning",
+        "title": "历史工单", "detail": "",
+        "refs": [{"global_id": "OLDG", "discipline": "arch",
+                  "unit": "A区-楼A", "file_path": "/p/A区/楼A.ifc",
+                  "storey": "2F"}],
+        "disciplines": ["arch"], "location": [3.0, 4.0, 0.0],
+        "storey": "2F", "unit": "A区-楼A",
+        "owner_discipline": "arch", "owner": "王设",
+        "status": "fixed", "created_batch": "OLD",
+        "created_at": "2026-01-01T00:00:00",
+        "updated_at": "2026-01-02T00:00:00", "created_by": "系统",
+        "fixed_by": "王设", "fixed_note": "历史整改",
+        "fixed_at": "2026-01-02T00:00:00", "sla_hours": 0,
+        "history": [
+            {"batch_id": "OLD", "at": "2026-01-01T00:00:00", "action": "created",
+             "from": "", "to": "open", "by": "系统", "note": ""},
+            {"batch_id": "OLD", "at": "2026-01-02T00:00:00", "action": "fix",
+             "from": "open", "to": "fixed", "by": "王设",
+             "note": "历史整改"}],
+    }
+    with tempfile.TemporaryDirectory() as td:
+        lp = os.path.join(td, "legacy.json")
+        with open(lp, "w", encoding="utf-8") as f:
+            _json.dump({"schema_version": 1, "project": "历史项目",
+                        "tickets": [legacy_ticket], "users": [],
+                        "notifications": []}, f, ensure_ascii=False)
+        ledl = CollabLedger.load(lp)
+        # 新批次显示名退化为“楼A”、issue_id 重排，问题仍检出
+        liss = _issue2("wall_free_end", "OLDG", "END-001", (3.0, 4.0),
+                       storey="2F")
+        lunit = _unit2("楼A", [liss], key="楼A", path="/p/A区/楼A.ifc")
+        ingest_batch(ledl, _batch([lunit], "NEW"), sla_hours=0)
+        tl = ledl.find("COLL-0001")
+        check(len(ledl.tickets) == 1, "历史旧指纹工单迁移而非新建")
+        check(tl.fingerprint != legacy_fp
+              and legacy_fp in tl.fingerprint_aliases,
+              "旧指纹记入别名，主键迁移到稳定指纹")
+        check(tl.status == "fixed" and tl.fixed_note == "历史整改",
+              "迁移保留原状态与整改记录")
+        check(any(h["action"] == "fp_migrate" for h in tl.history),
+              "指纹迁移写 fp_migrate 留痕")
+        # 再纳管一次，主键稳定不重复迁移
+        ingest_batch(ledl, _batch([lunit], "NEW"), sla_hours=0)
+        check(len(ledl.tickets) == 1, "迁移后再次纳管主键稳定")
+
     # --------------------------------------- 批量审查端到端纳管 ----
     try:
         from tools.make_sample_coordination import make_coordination_sample

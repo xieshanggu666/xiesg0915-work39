@@ -79,6 +79,8 @@ class UnitResult:
 
     name: str
     file_path: str
+    # 跨批次稳定标识（文件名去后缀），用于工单指纹；name 仅为批次内显示名
+    unit_key: str = ""
     ok: bool = True
     error: str = ""
 
@@ -130,6 +132,7 @@ class UnitResult:
     def to_dict(self) -> dict:
         return {
             "name": self.name,
+            "unit_key": self.unit_key or stable_unit_key(self.file_path),
             "file_path": self.file_path,
             "ok": self.ok,
             "error": self.error,
@@ -256,6 +259,17 @@ def _unit_base_name(file_path: str) -> str:
     return os.path.splitext(os.path.basename(file_path))[0]
 
 
+def stable_unit_key(file_path: str) -> str:
+    """单体的跨批次稳定标识：去掉 IFC 后缀的文件名（不含目录）。
+
+    与 :func:`unique_unit_names` 的**批次内显示名**不同：显示名在跨目录同名
+    文件并存时会带父目录前缀，且前缀深度随本批纳入的文件而变；工单指纹必须
+    使用与批次组成无关的稳定标识，否则局部复查 / 批次范围变化时同一单体会
+    “身份漂移”，导致指纹对不上而重复建单或无法销项。
+    """
+    return _unit_base_name(file_path)
+
+
 def unique_unit_names(files: list[str]) -> dict[str, str]:
     """为一批 IFC 文件生成不重名的单体名。
 
@@ -331,7 +345,8 @@ def _storey_label(storey: str) -> str:
 def _aggregate_unit(name: str, file_path: str, model: AuditModel) -> UnitResult:
     """从单模型核查结果聚合单体指标与单体×楼层指标。"""
     s = model.summary()
-    u = UnitResult(name=name, file_path=file_path, model=model)
+    u = UnitResult(name=name, file_path=file_path,
+                   unit_key=stable_unit_key(file_path), model=model)
     u.walls, u.doors, u.windows, u.rooms = (
         s["walls"], s["doors"], s["windows"], s["rooms"])
     u.issues = s["issues"]
@@ -655,7 +670,8 @@ def run_batch(paths: list[str],
             units.append(_aggregate_unit(name, fp, model))
         except Exception as exc:  # 单体失败不拖垮整批
             units.append(UnitResult(
-                name=name, file_path=fp, ok=False,
+                name=name, file_path=fp,
+                unit_key=stable_unit_key(fp), ok=False,
                 error=f"{type(exc).__name__}: {exc}"))
 
     all_storeys = [s for u in units for s in u.storeys]
