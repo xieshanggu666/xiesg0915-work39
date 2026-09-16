@@ -324,7 +324,8 @@ def _storey_of(elem) -> str:
 
 
 def load_discipline_file(file_path: str, unit: str,
-                         discipline: Optional[str] = None
+                         discipline: Optional[str] = None,
+                         unit_key: str = ""
                          ) -> tuple[list[CoordElement], DisciplineFile]:
     """从一份 IFC 提取协同核查所需构件。
 
@@ -334,7 +335,7 @@ def load_discipline_file(file_path: str, unit: str,
     """
     ifc_file = ifcopenshell.open(file_path)
     scale = project_length_scale(ifc_file)
-    unit_key = os.path.splitext(os.path.basename(file_path))[0]
+    unit_key = unit_key or os.path.splitext(os.path.basename(file_path))[0]
     df = DisciplineFile(unit=unit, file_path=file_path,
                         unit_key=unit_key,
                         discipline=discipline or "")
@@ -977,6 +978,7 @@ def run_coordination(paths: list[str],
                      gate_overrides: Optional[dict[str, object]] = None,
                      ledger_path: Optional[str] = None,
                      disabled_gate_keys: Optional[set[str]] = None,
+                     model_root: str = "",
                      progress: Optional[Callable[[int, str], None]] = None
                      ) -> CoordinationResult:
     """执行一次多专业协同核查并与项目台账合并。
@@ -986,6 +988,7 @@ def run_coordination(paths: list[str],
             或用 discipline_map 显式指定单体专业）。
         owners: 专业 -> 责任人姓名，如 ``{"struct": "张工", "mep": "李工"}``。
         ledger_path: 台账 JSON 路径；不给则不做跨批次合单（每次全新）。
+        model_root: 模型根锚点，稳定单体标识相对它计算（区分不同目录同名模型）。
     """
     def report(pct, msg):
         if progress:
@@ -999,19 +1002,28 @@ def run_coordination(paths: list[str],
     if not files:
         raise FileNotFoundError("指定路径下没有找到 IFC 文件")
 
+    # 模型根锚点：显式传入 > 本批公共父目录。批次联动时由
+    # _maybe_run_coordination 传入与批量核查一致的锚点；独立 coord run 用公共父目录
+    from .identity import build_unit_keys, common_parent_dir
+    root = model_root or common_parent_dir(files)
+    unit_keys = build_unit_keys(files, root)
+
     report(5, f"发现 {len(files)} 份专业模型，正在提取多专业构件…")
     all_elements: list[CoordElement] = []
     disc_files: list[DisciplineFile] = []
     for idx, fp in enumerate(files):
         unit = unit_names[fp]
+        unit_key = unit_keys.get(os.path.abspath(fp), "")
         disc = file_discs.get(fp) or None
         try:
-            elems, df = load_discipline_file(fp, unit, disc)
+            elems, df = load_discipline_file(fp, unit, disc,
+                                             unit_key=unit_key)
             all_elements.extend(elems)
             disc_files.append(df)
         except Exception as exc:
             disc_files.append(DisciplineFile(
-                unit=unit, file_path=fp, discipline=disc or "",
+                unit=unit, unit_key=unit_key, file_path=fp,
+                discipline=disc or "",
                 ok=False, error=f"{type(exc).__name__}: {exc}"))
         report(5 + int((idx + 1) / len(files) * 45),
                f"[{idx + 1}/{len(files)}] 已提取 {unit}"
@@ -1065,21 +1077,34 @@ def run_coordination(paths: list[str],
 
 def build_arch_writeback(result: CoordinationResult) -> dict:
     """生成回写建筑侧批次的协同结论（批次 + 按单体/楼层拆分）。"""
-    arch_units = {f.unit for f in result.files
-                  if f.discipline == DISC_ARCH}
+    arch_files = [f for f in result.files if f.discipline == DISC_ARCH]
+    arch_units = {f.unit for f in arch_files}
+    arch_keys = {f.unit_key for f in arch_files}
     per_unit: dict[str, dict] = {}
     for issue in result.issues:
         if not issue.active:
             continue
-        # 问题涉及的建筑单体（碰撞构件来自建筑模型时）；其余记“跨专业”
-        units = sorted({e["unit"] for e in issue.elements
-                        if e.get("discipline") in (DISC_ARCH, DISC_STRUCT)})
-        targets = [u for u in units if u in arch_units] or units or ["跨专业"]
-        for u in targets:
+        # 优先回写到建筑单体；问题只涉及结构时才回给该结构单体
+        elems = [e for e in issue.elements
+                 if e.get("discipline") == DISC_ARCH] or \
+                [e for e in issue.elements
+                 if e.get("discipline") in (DISC_ARCH, DISC_STRUCT)]
+        pairs = [(e["unit"], e.get("unit_key", "")) for e in elems]
+        arch_pairs = [(u, k) for u, k in pairs
+                      if u in arch_units or (k and k in arch_keys)]
+        if arch_pairs:
+            targets = arch_pairs
+        elif elems:
+            targets = pairs
+        else:
+            targets = [("跨专业", "")]
+        for u, k in targets:
             row = per_unit.setdefault(u, {
-                "unit": u, "active": 0, "errors": 0, "warnings": 0,
-                "overdue": 0, "escalated": 0,
-                "by_kind": {k: 0 for k in COORD_KINDS}})
+                "unit": u, "unit_key": k, "active": 0, "errors": 0,
+                "warnings": 0, "overdue": 0, "escalated": 0,
+                "by_kind": {kk: 0 for kk in COORD_KINDS}})
+            if k and not row.get("unit_key"):
+                row["unit_key"] = k
             row["active"] += 1
             row["errors" if issue.severity == "error" else "warnings"] += 1
             if issue.is_overdue():

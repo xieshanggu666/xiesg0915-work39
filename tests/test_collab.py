@@ -634,6 +634,69 @@ def run() -> int:
         ingest_batch(ledl, _batch([lunit], "NEW"), sla_hours=0)
         check(len(ledl.tickets) == 1, "迁移后再次纳管主键稳定")
 
+    # ----- 15) 不同目录同名模型：稳定键带目录，工单隔离不互相覆盖 -----
+    def _unit3(name, key, path, issues, ok=True):
+        return SimpleNamespace(
+            name=name, unit_key=key, file_path=path,
+            model=SimpleNamespace(issues=issues) if ok else None,
+            ok=ok, error="" if ok else "坏")
+
+    def _issue3(gid, iid, loc=(1.0, 1.0), storey="1F"):
+        return SimpleNamespace(kind="wall_free_end", severity="warning",
+                               title="自由端", detail="", global_ids=[gid],
+                               storey=storey, location=loc, measure=0.0,
+                               issue_id=iid)
+
+    leds = _ledger()
+    ka, kb = "A区/楼A", "B区/楼A"
+    fa, fb = "/p/A区/楼A.ifc", "/p/B区/楼A.ifc"
+    # 两同名文件（GlobalId 相同、位置不同）必须建两张工单
+    ingest_batch(leds, SimpleNamespace(batch_id="S1", units=[
+        _unit3("A区-楼A", ka, fa, [_issue3("GW", "END-001", (1.0, 1.0))]),
+        _unit3("B区-楼A", kb, fb, [_issue3("GW", "END-001", (9.0, 9.0))]),
+    ], coordination=None), sla_hours=0)
+    check(len(leds.tickets) == 2,
+          "不同目录同名模型（即便 GlobalId 相同）产生两张独立工单")
+    by_key = {t.unit_key: t for t in leds.tickets.values()}
+    check(set(by_key) == {ka, kb}, "工单按带目录稳定键归属")
+    # 只复查 A 区（已整改）-> A 销项，B 范围外保留
+    ingest_batch(leds, SimpleNamespace(batch_id="S2", units=[
+        _unit3("楼A", ka, fa, []),
+    ], coordination=None), sla_hours=0,
+        scope=ScanScope.make(units=[ka]))
+    check(by_key[ka].status == STATUS_CLEARED
+          and by_key[ka].last_cover_result == "covered",
+          "A 区同名模型复查销项")
+    check(by_key[kb].status == STATUS_OPEN
+          and by_key[kb].last_cover_result == "out_of_scope",
+          "B 区同名模型不被 A 区复查覆盖（状态保留）")
+
+    # ----- 16) 旧纯文件名 unit_key 迁移到相对路径键且不误并同名文件 -----
+    ledm = _ledger()
+    old_fp2 = "fp:" + make_legacy_audit_fingerprint(
+        "wall_free_end", ["MG"], unit_name="楼A",
+        issue_id="END-007", storey="1F")
+    old_t = collab.CollabTicket(
+        ticket_id="COLL-0901", fingerprint=old_fp2, source=SOURCE_AUDIT,
+        kind="wall_free_end", title="历史", unit="楼A",
+        location=(2.0, 2.0, 0.0), storey="1F",
+        refs=[ModelRef(global_id="MG", discipline="arch", unit="楼A",
+                       file_path="/p/A区/楼A.ifc", storey="1F")],
+        owner_discipline="arch", owner="王设", status="fixed",
+        fixed_note="旧整改", created_batch="O")
+    ledm.tickets[old_fp2] = old_t
+    # 新批次两个同名文件：A 区问题仍在（MG），B 区是另一个构件（MG2）
+    ingest_batch(ledm, SimpleNamespace(batch_id="M1", units=[
+        _unit3("A区-楼A", ka, fa, [_issue3("MG", "END-001", (2.0, 2.0))]),
+        _unit3("B区-楼A", kb, fb, [_issue3("MG2", "END-001", (5.0, 5.0))]),
+    ], coordination=None), sla_hours=0)
+    tm = ledm.find("COLL-0901")
+    check(tm.unit_key == ka and tm.status == "fixed"
+          and tm.fixed_note == "旧整改",
+          "旧文件名键工单迁移到 A区相对路径键，状态/整改保留")
+    check(old_fp2 in tm.fingerprint_aliases, "迁移保留旧指纹别名")
+    check(len(ledm.tickets) == 2, "B 区同名文件另建工单，未与 A 区误并")
+
     # --------------------------------------- 批量审查端到端纳管 ----
     try:
         from tools.make_sample_coordination import make_coordination_sample

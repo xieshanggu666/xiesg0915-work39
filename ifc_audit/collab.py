@@ -722,6 +722,13 @@ def ingest_coordination(ledger: CollabLedger, coord_result,
             continue
         if scope.kinds and not scope.covers_kind(ci.kind):
             continue
+        # 单体范围：问题涉及的任一稳定单体落在复查范围内才纳管
+        if scope.units:
+            ci_keys = {e.get("unit_key") or e.get("unit", "")
+                       for e in ci.elements}
+            ci_keys.discard("")
+            if not (ci_keys & set(scope.units)):
+                continue
         # 闭环台账以 (来源 + 协同指纹) 作主键，避免与其它来源撞键
         key = f"fp:{ci.fingerprint}"
         present.add(key)
@@ -905,7 +912,9 @@ def _find_legacy_audit_ticket(ledger: CollabLedger, iss,
         if hit2 is not None and hit2.source == SOURCE_AUDIT:
             return k2, hit2
 
-    # 2) 物理弱键：在 audit 活动 / 已闭环工单中找唯一匹配
+    # 2) 物理弱键：在 audit 活动 / 已闭环工单中找唯一匹配；
+    #    跨目录同名文件可能产生多个 basename 相同候选，此时只接受
+    #    **稳定键完全相等** 的那个，避免 A区/楼A 误并 B区/楼A
     target = _weak_audit_key(iss.kind, gids, unit_key, iss.storey,
                              iss.location, iss.measure)
     candidates = [
@@ -914,7 +923,35 @@ def _find_legacy_audit_ticket(ledger: CollabLedger, iss,
         and _weak_key_compatible(t, target)]
     if len(candidates) == 1:
         return candidates[0]
+    if len(candidates) > 1:
+        exact = [(k, t) for k, t in candidates
+                 if (t.unit_key or "") == unit_key]
+        if len(exact) == 1:
+            return exact[0]
     return None, None
+
+
+def _unit_key_compatible(ticket_key: str, new_key: str) -> bool:
+    """两代稳定单体标识是否指向同一单体（兼容历史纯文件名键）。
+
+    旧台账 ``unit_key`` 是纯文件名（``楼A``），新键是相对模型根的路径
+    （``A区/楼A``）；同一文件时新键以旧键结尾，或二者 basename 相同。
+    basename 相同但目录不同（真正的跨目录同名文件）时，必须靠 GlobalId /
+    位置等物理要素进一步区分，调用方只接受唯一候选。
+    """
+    if not ticket_key or not new_key:
+        return True
+    if ticket_key == new_key:
+        return True
+    a = ticket_key.replace("\\", "/").rstrip("/")
+    b = new_key.replace("\\", "/").rstrip("/")
+    if a == b:
+        return True
+    base_a = a.rsplit("/", 1)[-1]
+    base_b = b.rsplit("/", 1)[-1]
+    # 新键是相对路径、旧键是其文件名尾段（同一文件的两代键）
+    return base_a == base_b and (a.endswith("/" + b) or b.endswith("/" + a)
+                                 or base_a == a or base_b == b)
 
 
 def _weak_key_compatible(t: CollabTicket, target: tuple) -> bool:
@@ -923,8 +960,8 @@ def _weak_key_compatible(t: CollabTicket, target: tuple) -> bool:
     tkind, tuk, tstorey, tgid, tloc, tmeas = _ticket_weak_audit_key(t)
     if tkind != kind:
         return False
-    # 旧工单无稳定单体标识时不比对单体（由构件 GlobalId + 位置锁定）
-    if tuk and unit_key and tuk != unit_key:
+    # 单体：兼容两代键（旧纯文件名 vs 新相对路径）
+    if tuk and unit_key and not _unit_key_compatible(tuk, unit_key):
         return False
     if gid_part != tgid:
         return False
@@ -990,16 +1027,16 @@ def ingest_batch(ledger: CollabLedger, batch,
     # 单模型问题均归属建筑专业；专业范围不含建筑时整体跳过
     audit_in_disc = scope.covers_disciplines(["arch"])
     for unit in batch.units:
-        if scope.units and unit.name not in scope.units:
+        uk = _unit_key_of_unit(unit)
+        # 复查范围按稳定键（CLI 已换算），兼容用户直接传显示名
+        if scope.units and unit.name not in scope.units and uk not in scope.units:
             continue
         model = getattr(unit, "model", None)
         if model is None:
             # 扫描失败的单体在 _sweep_with_coverage 中按 scan_failed 保留
             continue
         unit_name = unit.name
-        unit_key = getattr(unit, "unit_key", "") or \
-            os.path.splitext(os.path.basename(
-                getattr(unit, "file_path", "")))[0]
+        unit_key = uk
         file_path = getattr(unit, "file_path", "")
         for iss in model.issues:
             if iss.severity == "info" and not include_infos:

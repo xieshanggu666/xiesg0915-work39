@@ -143,7 +143,7 @@ def export_collab_excel(ledger: CollabLedger, out_path: str,
     # 2) 工单台账
     ws = wb.create_sheet("工单台账")
     headers = ["工单编号", "来源", "状态", "时限状态", "严重程度", "问题类型",
-               "标题", "责任专业", "责任人", "单体", "楼层", "位置(x,y,z)",
+               "标题", "责任专业", "责任人", "单体", "单体标识", "楼层", "位置(x,y,z)",
                "量化指标", "跨模型构件", "涉及专业",
                "整改时限h", "整改截止", "剩余/超期h", "升级",
                "整改说明(回写)", "关闭原因",
@@ -166,6 +166,8 @@ def export_collab_excel(ledger: CollabLedger, out_path: str,
         rem = t.sla_remaining_hours()
         ver = "；".join(f"{k.split('|', 1)[0]} {v[:10]}"
                         for k, v in (t.last_scan_versions or {}).items())
+        unit_keys = t.unit_key or "、".join(
+            sorted({r.unit_key for r in t.refs if r.unit_key})) or "-"
         ws.append([
             t.ticket_id, SOURCE_CN.get(t.source, t.source),
             STATUS_CN.get(t.status, t.status), t.sla_status_cn(),
@@ -174,6 +176,7 @@ def export_collab_excel(ledger: CollabLedger, out_path: str,
             DISC_CN.get(t.owner_discipline, t.owner_discipline),
             t.owner or "（未指派）", t.unit or "、".join(
                 sorted({r.unit for r in t.refs if r.unit})) or "-",
+            unit_keys,
             t.storey or "-",
             f"({t.location[0]:.2f},{t.location[1]:.2f},{t.location[2]:.2f})",
             f"{t.measure:g} {t.measure_label}".strip(),

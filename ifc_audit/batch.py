@@ -79,7 +79,8 @@ class UnitResult:
 
     name: str
     file_path: str
-    # 跨批次稳定标识（文件名去后缀），用于工单指纹；name 仅为批次内显示名
+    # 跨批次稳定标识（相对模型根的路径，如 A区/楼A），用于工单指纹；
+    # name 仅为批次内显示名（跨目录同名时带父目录消歧），不进指纹
     unit_key: str = ""
     ok: bool = True
     error: str = ""
@@ -199,6 +200,8 @@ class BatchResult:
     history_dir: str = ""
     rule_pack: Optional[dict] = None
     enabled_checks: list[str] = field(default_factory=list)
+    # 本批模型根锚点（稳定单体标识相对它计算），随快照持久化以便追溯
+    model_root: str = ""
 
     # 多专业协同核查结果（纳入建筑/结构/机电 ≥2 专业时填充，否则为 None）
     coordination: object = None
@@ -218,6 +221,7 @@ class BatchResult:
             "trend": self.trend,
             "rule_pack": self.rule_pack,
             "enabled_checks": list(self.enabled_checks),
+            "model_root": self.model_root,
             "coordination": (self.coordination.to_dict()
                              if self.coordination is not None else None),
             "units": [u.to_dict() for u in self.units],
@@ -259,15 +263,14 @@ def _unit_base_name(file_path: str) -> str:
     return os.path.splitext(os.path.basename(file_path))[0]
 
 
-def stable_unit_key(file_path: str) -> str:
-    """单体的跨批次稳定标识：去掉 IFC 后缀的文件名（不含目录）。
+def stable_unit_key(file_path: str, model_root: str = "") -> str:
+    """单体跨批次稳定标识（见 :mod:`ifc_audit.identity`）。
 
-    与 :func:`unique_unit_names` 的**批次内显示名**不同：显示名在跨目录同名
-    文件并存时会带父目录前缀，且前缀深度随本批纳入的文件而变；工单指纹必须
-    使用与批次组成无关的稳定标识，否则局部复查 / 批次范围变化时同一单体会
-    “身份漂移”，导致指纹对不上而重复建单或无法销项。
+    等于模型相对模型根锚点的 POSIX 相对路径去后缀，可区分不同目录下的同名
+    模型；``name``（:func:`unique_unit_names`）只是批次内显示名，不进指纹。
     """
-    return _unit_base_name(file_path)
+    from .identity import stable_unit_key as _key
+    return _key(file_path, model_root)
 
 
 def unique_unit_names(files: list[str]) -> dict[str, str]:
@@ -342,11 +345,12 @@ def _storey_label(storey: str) -> str:
 
 # ---------------------------------------------------------------- 聚合 ----
 
-def _aggregate_unit(name: str, file_path: str, model: AuditModel) -> UnitResult:
+def _aggregate_unit(name: str, file_path: str, model: AuditModel,
+                    unit_key: str = "") -> UnitResult:
     """从单模型核查结果聚合单体指标与单体×楼层指标。"""
     s = model.summary()
     u = UnitResult(name=name, file_path=file_path,
-                   unit_key=stable_unit_key(file_path), model=model)
+                   unit_key=unit_key or stable_unit_key(file_path), model=model)
     u.walls, u.doors, u.windows, u.rooms = (
         s["walls"], s["doors"], s["windows"], s["rooms"])
     u.issues = s["issues"]
@@ -610,6 +614,7 @@ def run_batch(paths: list[str],
               coord_gate_overrides: Optional[dict[str, object]] = None,
               coord_discipline_map: Optional[dict[str, str]] = None,
               history_dir: str = "",
+              model_root: str = "",
               ) -> BatchResult:
     """批量核查多个 IFC 文件并完成聚合与门禁判定。
 
@@ -631,16 +636,25 @@ def run_batch(paths: list[str],
         coord_gate_profile / coord_gate_overrides: 协同门禁预设与单项覆盖。
         coord_discipline_map: 显式指定单体专业（单体名或绝对路径 -> 专业）。
         history_dir: 批次历史目录，提供时协同台账按项目归档其中。
+        model_root: 模型根锚点（显式指定）；不给定时按项目历史配置 /
+            本批文件公共父目录确定，用于生成跨批次稳定单体标识。
     """
     def report(pct, msg):
         if progress:
             progress(pct, msg)
 
+    from .identity import resolve_model_root, build_unit_keys
+
     files = discover_ifc_files(paths)
     if not files:
         raise FileNotFoundError("指定路径下没有找到 IFC 文件")
-    # 不同目录下的同名文件需要消歧，保证单体名在批次内唯一
+    # 模型根锚点：显式 > 项目历史固化 > 本批公共父目录（首次自动持久化）
+    model_root_dir, root_reused = resolve_model_root(
+        files, project=project, history_dir=history_dir,
+        explicit=model_root)
+    # 不同目录下的同名文件：显示名消歧 + 稳定键相对模型根，二者各司其职
     unit_names = unique_unit_names(files)
+    unit_keys = build_unit_keys(files, model_root_dir)
     batch_id = _new_batch_id()
 
     if gate is None:
@@ -654,6 +668,7 @@ def run_batch(paths: list[str],
     n = len(files)
     for idx, fp in enumerate(files):
         name = unit_names[fp]
+        key = unit_keys[os.path.abspath(fp)]
         base_pct = int(idx / n * 100)
         end_pct = int((idx + 1) / n * 100)
         report(base_pct, f"[{idx + 1}/{n}] 正在核查单体 {name} …")
@@ -667,11 +682,11 @@ def run_batch(paths: list[str],
                 provenance=threshold_provenance,
                 enabled_kinds=enabled_kinds,
                 rule_pack=rule_pack)
-            units.append(_aggregate_unit(name, fp, model))
+            units.append(_aggregate_unit(name, fp, model, unit_key=key))
         except Exception as exc:  # 单体失败不拖垮整批
             units.append(UnitResult(
                 name=name, file_path=fp,
-                unit_key=stable_unit_key(fp), ok=False,
+                unit_key=key, ok=False,
                 error=f"{type(exc).__name__}: {exc}"))
 
     all_storeys = [s for u in units for s in u.storeys]
@@ -695,6 +710,7 @@ def run_batch(paths: list[str],
         enabled_kinds=enabled_kinds,
         history_dir=history_dir,
         gate_results=gate_results,
+        model_root=model_root_dir,
         progress=progress)
 
     # 门禁关闭（none 预设）时不阻断；启用时全部规则通过才放行
@@ -723,6 +739,7 @@ def run_batch(paths: list[str],
         rule_pack=rule_pack.to_dict() if rule_pack is not None else None,
         enabled_checks=enabled_checks_from_kinds(enabled_kinds),
         coordination=coordination,
+        model_root=model_root_dir,
     )
     return batch
 
@@ -750,7 +767,7 @@ def _maybe_run_coordination(files: list[str], unit_names: dict[str, str],
                             owners, settings, gate_profile, gate_overrides,
                             discipline_map, enabled_kinds, history_dir,
                             gate_results: list["GateRuleResult"],
-                            progress) -> object:
+                            progress, model_root: str = "") -> object:
     """按开关 / 文件专业组成决定并执行多专业协同核查。
 
     协同门禁的逐条判定同时镜像进批次 ``gate_results``（级别 ``coordination``），
@@ -784,6 +801,7 @@ def _maybe_run_coordination(files: list[str], unit_names: dict[str, str],
         discipline_map=discipline_map, owners=owners, settings=settings,
         gate_profile=gate_profile, gate_overrides=gate_overrides,
         ledger_path=ledger_path, disabled_gate_keys=disabled,
+        model_root=model_root,
         progress=(lambda p, m: progress(p, f"多专业协同：{m}")
                   if progress else None))
 
@@ -813,6 +831,7 @@ def run_batch_with_config(paths: list[str],
                           coord_gate_overrides: Optional[dict] = None,
                           coord_discipline_map: Optional[dict[str, str]] = None,
                           history_dir: str = os.path.join("output", "batch_history"),
+                          model_root: str = "",
                           ) -> BatchResult:
     """便捷入口：先解析核查阈值与门禁配置，再执行批量核查。"""
     th, th_prov = resolve_thresholds(
@@ -828,7 +847,7 @@ def run_batch_with_config(paths: list[str],
                      coord_gate_profile=coord_gate_profile,
                      coord_gate_overrides=coord_gate_overrides,
                      coord_discipline_map=coord_discipline_map,
-                     history_dir=history_dir)
+                     history_dir=history_dir, model_root=model_root)
 
 
 def run_batch_with_rule_pack(paths: list[str],
@@ -843,6 +862,7 @@ def run_batch_with_rule_pack(paths: list[str],
                              coord_gate_overrides: Optional[dict] = None,
                              coord_discipline_map: Optional[dict[str, str]] = None,
                              history_dir: str = os.path.join("output", "batch_history"),
+                             model_root: str = "",
                              ) -> BatchResult:
     """便捷入口：用已物化的企业规则包执行批量核查。
 
@@ -864,7 +884,7 @@ def run_batch_with_rule_pack(paths: list[str],
         coord_gate_profile=coord_gate_profile,
         coord_gate_overrides=coord_gate_overrides,
         coord_discipline_map=coord_discipline_map,
-        history_dir=history_dir)
+        history_dir=history_dir, model_root=model_root)
 
 
 # ---------------------------------------------------------------- 趋势 ----
@@ -890,15 +910,31 @@ def build_trend(batch: BatchResult, previous: Optional[dict]) -> dict:
         deltas[key] = {"label": label, "old": old, "new": new,
                        "delta": round(new - old, 3)}
 
-    prev_units = {u["name"]: u for u in previous.get("units", [])}
-    cur_units = {u.name: u for u in batch.units}
+    # 单体按**稳定标识**（unit_key）匹配，显示名仅对旧快照（无 unit_key）回落；
+    # 避免跨目录同名文件消歧前缀变化时被误判成“单体新增 / 缺失”。
+    def _prev_key(u: dict) -> str:
+        return u.get("unit_key") or u.get("name") or ""
+
+    prev_units = {_prev_key(u): u for u in previous.get("units", [])}
+    prev_by_name = {u.get("name"): u for u in previous.get("units", [])
+                    if u.get("name")}
+    cur_units = {(u.unit_key or u.name): u for u in batch.units}
+
+    def _match_old(key: str, new_u):
+        old = prev_units.get(key)
+        if old is None and new_u is not None and new_u.name in prev_by_name:
+            # 旧快照只有显示名（无稳定键）时回落匹配
+            old = prev_by_name[new_u.name]
+        return old
+
     unit_delta = []
-    for name in sorted(set(prev_units) | set(cur_units)):
-        old = prev_units.get(name)
-        new = cur_units.get(name)
+    for key in sorted(set(prev_units) | set(cur_units)):
+        new = cur_units.get(key)
+        old = prev_units.get(key)
+        name = (new.name if new else old.get("name", key))
         if old and new:
             unit_delta.append({
-                "unit": name,
+                "unit": name, "unit_key": key,
                 "errors_old": old.get("errors", 0),
                 "errors_new": new.errors,
                 "errors_delta": new.errors - old.get("errors", 0),
@@ -909,14 +945,16 @@ def build_trend(batch: BatchResult, previous: Optional[dict]) -> dict:
             })
         elif new:
             unit_delta.append({
-                "unit": name, "errors_old": None, "errors_new": new.errors,
+                "unit": name, "unit_key": key,
+                "errors_old": None, "errors_new": new.errors,
                 "errors_delta": None, "issues_old": None,
                 "issues_new": new.issues, "issues_delta": None,
                 "status": "new",
             })
         else:
             unit_delta.append({
-                "unit": name, "errors_old": old.get("errors", 0),
+                "unit": name, "unit_key": key,
+                "errors_old": old.get("errors", 0),
                 "errors_new": None, "errors_delta": None,
                 "issues_old": old.get("issues", 0), "issues_new": None,
                 "issues_delta": None, "status": "missing",
@@ -936,8 +974,10 @@ def build_trend(batch: BatchResult, previous: Optional[dict]) -> dict:
         "previous_rule_switch": previous.get("rule_switch"),
         "deltas": deltas,
         "unit_delta": unit_delta,
-        "units_new": [n for n in cur_units if n not in prev_units],
-        "units_missing": [n for n in prev_units if n not in cur_units],
+        # 用显示名列出新增 / 缺失单体（内部已按稳定键匹配）
+        "units_new": [d["unit"] for d in unit_delta if d["status"] == "new"],
+        "units_missing": [d["unit"] for d in unit_delta
+                          if d["status"] == "missing"],
     }
 
 

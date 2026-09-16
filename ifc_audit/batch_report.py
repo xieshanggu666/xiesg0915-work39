@@ -116,7 +116,7 @@ def _add_coordination_sheets(wb, batch) -> None:
     ws = wb.create_sheet("协同工单")
     headers = ["工单编号", "状态", "时限状态", "严重程度", "问题类型", "标题",
                "责任专业", "责任人", "楼层", "位置(x,y,z)", "量化指标",
-               "涉及构件", "涉及单体",
+               "涉及构件", "涉及单体", "涉及单体标识",
                "整改时限(h)", "整改截止", "剩余/超期(h)", "升级",
                "创建批次", "整改人", "复核人", "详细说明"]
     ws.append(headers)
@@ -137,6 +137,8 @@ def _add_coordination_sheets(wb, batch) -> None:
             f"{i.measure:g} {i.measure_label}".strip(),
             elems,
             "、".join(sorted({e["unit"] for e in i.elements if e.get("unit")})),
+            "、".join(sorted({e.get("unit_key") for e in i.elements
+                              if e.get("unit_key")})),
             f"{i.sla_hours:g}" if i.sla_hours else "-",
             (i.due_at or "-").replace("T", " ")[:16],
             ("-" if rem is None else (f"超期 {-rem:g}" if rem < 0 else f"{rem:g}")),

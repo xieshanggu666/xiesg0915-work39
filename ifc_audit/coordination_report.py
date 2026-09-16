@@ -111,7 +111,7 @@ def export_coordination_excel(result: CoordinationResult, out_path: str) -> str:
     ws = wb.create_sheet("碰撞与洞口工单")
     headers = ["工单编号", "状态", "时限状态", "严重程度", "问题类型", "标题",
                "责任专业", "责任人", "楼层", "位置(x,y,z)",
-               "量化指标", "涉及构件", "涉及专业",
+               "量化指标", "涉及构件", "涉及专业", "涉及单体标识",
                "整改时限(h)", "整改截止", "剩余/超期(h)", "升级状态",
                "创建批次", "创建时间", "整改人/整改说明", "复核人/时间",
                "流转记录"]
@@ -145,6 +145,8 @@ def export_coordination_excel(result: CoordinationResult, out_path: str) -> str:
             f"{i.measure:g} {i.measure_label}".strip(),
             elems,
             "、".join(DISC_CN.get(d, d) for d in i.disciplines),
+            "、".join(sorted({e.get("unit_key") for e in i.elements
+                              if e.get("unit_key")})) or "-",
             f"{i.sla_hours:g}" if i.sla_hours else "-",
             _fmt_dt(i.due_at), rem_txt, esc_txt,
             i.created_batch, _fmt_dt(i.created_at), fixed, verified, history,
@@ -172,15 +174,16 @@ def export_coordination_excel(result: CoordinationResult, out_path: str) -> str:
 
     # 3) 专业模型清单
     ws = wb.create_sheet("专业模型清单")
-    ws.append(["单体名", "专业", "文件路径", "状态",
+    ws.append(["单体名", "单体标识", "专业", "文件路径", "状态",
                "参与构件数", "预留洞口数", "错误"])
     for f in result.files:
         ws.append([
-            f.unit, DISC_CN.get(f.discipline, f.discipline or "未判定"),
+            f.unit, getattr(f, "unit_key", "") or f.unit,
+            DISC_CN.get(f.discipline, f.discipline or "未判定"),
             f.file_path, "成功" if f.ok else "失败",
             f.n_elements, f.n_openings, f.error or "-"])
         if not f.ok:
-            for c in range(1, 8):
+            for c in range(1, 9):
                 ws.cell(row=ws.max_row, column=c).fill = PatternFill(
                     "solid", fgColor=_ERR_FILL)
     _style_header(ws, 7)
@@ -231,7 +234,7 @@ def export_issues_csv(result: CoordinationResult, out_path: str) -> str:
         w = csv.writer(f)
         w.writerow(["工单编号", "状态", "时限状态", "严重程度", "问题类型", "标题",
                     "责任专业", "责任人", "楼层", "x", "y", "z",
-                    "量化指标", "涉及构件GlobalId", "涉及单体",
+                    "量化指标", "涉及构件GlobalId", "涉及单体", "涉及单体标识",
                     "整改时限h", "整改截止", "剩余或超期h",
                     "升级级别", "升级时间",
                     "创建批次", "创建时间",
@@ -250,6 +253,8 @@ def export_issues_csv(result: CoordinationResult, out_path: str) -> str:
                 f"{i.measure:g} {i.measure_label}".strip(),
                 ";".join(e["global_id"] for e in i.elements),
                 ";".join(sorted({e["unit"] for e in i.elements if e.get("unit")})),
+                ";".join(sorted({e.get("unit_key") for e in i.elements
+                                 if e.get("unit_key")})),
                 i.sla_hours or "", _fmt_dt(i.due_at),
                 "" if rem is None else round(rem, 1),
                 i.escalation_level, _fmt_dt(i.escalated_at),

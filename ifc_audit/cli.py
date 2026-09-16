@@ -818,14 +818,29 @@ def _cmd_batch(args) -> int:
                   f"可选：{'、'.join(sorted(valid_kinds))}", file=sys.stderr)
             return 2
         if recheck_units:
-            # 先展开输入路径，按 unique_unit_names 得到的单体名精确过滤
+            # 展开输入并同时按 显示名 / 稳定单体键（相对模型根路径）过滤
             from .batch import discover_ifc_files, unique_unit_names
+            from .identity import resolve_model_root, build_unit_keys
             all_files = discover_ifc_files(args.paths)
             name_of = unique_unit_names(all_files)
+            _root, _ = resolve_model_root(
+                all_files, project=args.project, history_dir=history_dir,
+                explicit=getattr(args, "model_root", "") or "")
+            key_of = build_unit_keys(all_files, _root)  # 绝对路径 -> 稳定键
             wanted = set(recheck_units)
-            available = set(name_of.values())
-            kept = [f for f in all_files if name_of.get(f) in wanted]
-            missing = sorted(wanted - available)
+
+            def _matches(fp: str) -> bool:
+                afp = os.path.abspath(fp)
+                return (name_of.get(fp) in wanted
+                        or key_of.get(afp) in wanted
+                        or key_of.get(afp, "").replace("/", os.sep) in wanted)
+
+            kept = [f for f in all_files if _matches(f)]
+            matched_names = {name_of[f] for f in kept}
+            matched_keys = {key_of.get(os.path.abspath(f), "") for f in kept}
+            available = set(name_of.values()) | set(key_of.values())
+            missing = sorted(w for w in wanted
+                             if w not in matched_names and w not in matched_keys)
             if not kept:
                 print(f"配置错误：复查单体 {'、'.join(sorted(wanted))} "
                       f"在输入中没有匹配的 IFC 文件；可用单体："
@@ -835,8 +850,13 @@ def _cmd_batch(args) -> int:
                 print(f"[warn] 复查单体 {'、'.join(missing)} 未在输入中找到，"
                       "已忽略", file=sys.stderr)
             scan_paths = kept
+            # 复查范围统一用命中文件的稳定键（覆盖判定按稳定键）
+            scope_units = sorted({key_of.get(os.path.abspath(f))
+                                  or name_of[f] for f in kept})
+        else:
+            scope_units = []
         scan_scope = collab_mod.ScanScope.make(
-            units=recheck_units, disciplines=recheck_disciplines,
+            units=scope_units, disciplines=recheck_disciplines,
             kinds=recheck_kinds)
         if scan_scope.partial and not args.quiet:
             print(f"[复查] 本次为局部复查：{scan_scope.describe()}；"
@@ -877,6 +897,7 @@ def _cmd_batch(args) -> int:
             coord_gate_overrides=coord_gate_overrides or None,
             coord_discipline_map=coord_discipline_map or None,
             history_dir=history_dir,
+            model_root=getattr(args, "model_root", "") or "",
         )
         if mat is not None:
             batch = run_batch_with_rule_pack(
@@ -1324,6 +1345,12 @@ def main(argv=None) -> int:
                          metavar="KEY=VALUE",
                          help="单项覆盖协同检测参数（毫米），可重复，如 "
                               "--coord-set opening_pos_tol_mm=150")
+    p_batch.add_argument("--model-root", default="", metavar="目录",
+                         help="模型根锚点目录：稳定单体标识取相对该根的路径"
+                              "（去后缀），用于区分不同目录下的同名模型"
+                              "（如 A区/楼A、B区/楼A）。不给定时首次按本批"
+                              "文件公共父目录自动确定并固化到项目历史，之后"
+                              "跨批次沿用，保证单体身份一致")
     # 协同问题闭环（统一纳管批量审查 + 协同 + 规则校验问题）
     p_batch.add_argument("--collab", dest="collab_mode", action="store_const",
                          const="on", default="on",
